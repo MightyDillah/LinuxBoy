@@ -206,6 +206,9 @@ impl SimpleComponent for MainWindow {
                     dialog.widget().close();
                 }
             }
+            MainWindowMsg::SystemSetupOutput(SystemSetupOutput::SystemCheckUpdated(system_check)) => {
+                self.system_check = system_check;
+            }
         }
     }
 }

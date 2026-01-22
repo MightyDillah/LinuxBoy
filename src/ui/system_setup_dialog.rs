@@ -7,7 +7,7 @@ use crate::core::runtime_manager::RuntimeManager;
 
 #[derive(Debug)]
 pub enum SystemSetupMsg {
-    DownloadProton,
+    DownloadProton { reinstall: bool },
     DownloadProgress { status: String, progress: f64 },  // status text and 0.0-1.0 progress
     DownloadVersion(String),
     DownloadComplete,
@@ -19,6 +19,7 @@ pub enum SystemSetupMsg {
 #[derive(Debug)]
 pub enum SystemSetupOutput {
     CloseRequested,
+    SystemCheckUpdated(SystemCheck),
 }
 
 pub struct SystemSetupDialog {
@@ -106,7 +107,7 @@ impl SimpleComponent for SystemSetupDialog {
                     attach[2, 1, 1, 1] = &Label {
                         #[watch]
                         set_label: if model.system_check.vulkan_installed {
-                            ""
+                            "Reinstall: sudo apt install --reinstall vulkan-tools libvulkan1 libvulkan1:i386"
                         } else {
                             "Run: sudo apt install vulkan-tools"
                         },
@@ -131,7 +132,7 @@ impl SimpleComponent for SystemSetupDialog {
                     attach[2, 2, 1, 1] = &Label {
                         #[watch]
                         set_label: if model.system_check.mesa_installed {
-                            ""
+                            "Reinstall: sudo apt install --reinstall mesa-vulkan-drivers mesa-vulkan-drivers:i386 libgl1-mesa-dri:amd64 libgl1-mesa-dri:i386 libgl1-mesa-glx:amd64 libgl1-mesa-glx:i386"
                         } else {
                             "Run: sudo apt install mesa-vulkan-drivers"
                         },
@@ -153,18 +154,37 @@ impl SimpleComponent for SystemSetupDialog {
                         },
                         set_halign: gtk4::Align::Start,
                     },
-                    attach[2, 3, 1, 1] = &Button {
-                        #[watch]
-                        set_label: if model.is_downloading {
-                            "Downloading..."
-                        } else {
-                            "Download Latest"
+                    attach[2, 3, 1, 1] = &Box {
+                        set_orientation: Orientation::Horizontal,
+                        set_spacing: 10,
+
+                        append = &Button {
+                            #[watch]
+                            set_label: if model.is_downloading {
+                                "Downloading..."
+                            } else {
+                                "Download Latest"
+                            },
+                            #[watch]
+                            set_visible: !model.system_check.proton_installed,
+                            #[watch]
+                            set_sensitive: !model.is_downloading,
+                            connect_clicked => SystemSetupMsg::DownloadProton { reinstall: false },
                         },
-                        #[watch]
-                        set_visible: !model.system_check.proton_installed,
-                        #[watch]
-                        set_sensitive: !model.is_downloading,
-                        connect_clicked => SystemSetupMsg::DownloadProton,
+
+                        append = &Button {
+                            #[watch]
+                            set_label: if model.is_downloading {
+                                "Reinstalling..."
+                            } else {
+                                "Reinstall Latest"
+                            },
+                            #[watch]
+                            set_visible: model.system_check.proton_installed,
+                            #[watch]
+                            set_sensitive: !model.is_downloading,
+                            connect_clicked => SystemSetupMsg::DownloadProton { reinstall: true },
+                        },
                     },
                 },
 
@@ -306,10 +326,14 @@ impl SimpleComponent for SystemSetupDialog {
 
     fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>) {
         match msg {
-            SystemSetupMsg::DownloadProton => {
+            SystemSetupMsg::DownloadProton { reinstall } => {
                 println!("Starting Proton-GE download in background...");
                 self.is_downloading = true;
-                self.download_status = "Fetching latest release information...".to_string();
+                if reinstall {
+                    self.download_status = "Preparing reinstall...".to_string();
+                } else {
+                    self.download_status = "Fetching latest release information...".to_string();
+                }
                 self.download_progress = 0.0;
                 self.download_version = None;
                 
@@ -339,7 +363,7 @@ impl SimpleComponent for SystemSetupDialog {
                             });
                             
                             // Install with progress callbacks that send to channel
-                            match runtime_mgr.install_proton_ge(&release, |status, progress| {
+                            match runtime_mgr.install_proton_ge(&release, reinstall, |status, progress| {
                                 let _ = tx.send(DownloadUpdate::Progress { status, progress });
                             }) {
                                 Ok(path) => {
@@ -412,6 +436,9 @@ impl SimpleComponent for SystemSetupDialog {
                 self.download_progress = 1.0;
                 // Refresh system check
                 self.system_check = SystemCheck::check();
+                let _ = sender.output(SystemSetupOutput::SystemCheckUpdated(
+                    self.system_check.clone(),
+                ));
             }
             
             SystemSetupMsg::DownloadError(error) => {

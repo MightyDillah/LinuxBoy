@@ -107,7 +107,8 @@ impl SystemCheck {
         if let Ok(entries) = std::fs::read_dir(&runtimes_dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name();
-                if name.to_string_lossy().starts_with("proton-ge-") {
+                let name = name.to_string_lossy().to_lowercase();
+                if name.starts_with("proton-ge-") || name.starts_with("ge-proton") {
                     return true;
                 }
             }

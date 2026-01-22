@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -78,8 +78,14 @@ impl RuntimeManager {
             .find(|asset| asset.name.ends_with(".sha512sum"))
     }
 
-    /// Download a file from URL with progress callback
-    pub fn download_file<F>(&self, url: &str, dest_path: &Path, mut progress_callback: F) -> Result<()>
+    /// Download a file from URL with resume support and progress callback
+    pub fn download_file<F>(
+        &self,
+        url: &str,
+        dest_path: &Path,
+        expected_size: Option<u64>,
+        mut progress_callback: F,
+    ) -> Result<()>
     where
         F: FnMut(u64, u64),  // (downloaded_bytes, total_bytes)
     {
@@ -90,37 +96,121 @@ impl RuntimeManager {
             .user_agent("LinuxBoy/0.1")
             .build()?;
 
-        let mut response = client.get(url).send()?;
-        
-        if !response.status().is_success() {
-            anyhow::bail!("Download failed with status: {}", response.status());
-        }
-
-        let total_size = response.content_length().unwrap_or(0);
-        println!("File size: {} MB", total_size / 1_048_576);
+        let expected_size = expected_size.filter(|size| *size > 0);
+        let filename = dest_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("download");
+        let temp_path = dest_path.with_file_name(format!("{}.part", filename));
 
         // Create parent directory if needed
         if let Some(parent) = dest_path.parent() {
             fs::create_dir_all(parent)?;
         }
 
-        let mut file = File::create(dest_path)?;
-        let mut downloaded: u64 = 0;
-        let mut buffer = [0u8; 8192];
+        // If we already have a full file, reuse it
+        if dest_path.exists() {
+            if let Some(expected) = expected_size {
+                let existing = dest_path.metadata()?.len();
+                if existing == expected {
+                    progress_callback(existing, expected);
+                    return Ok(());
+                }
 
+                if existing < expected {
+                    let _ = fs::rename(dest_path, &temp_path);
+                } else {
+                    fs::remove_file(dest_path)?;
+                }
+            } else {
+                return Ok(());
+            }
+        }
+
+        let mut existing = if temp_path.exists() {
+            temp_path.metadata()?.len()
+        } else {
+            0
+        };
+
+        if let Some(expected) = expected_size {
+            if existing > expected {
+                fs::remove_file(&temp_path)?;
+                existing = 0;
+            }
+        }
+
+        let mut response = if existing > 0 {
+            client
+                .get(url)
+                .header(reqwest::header::RANGE, format!("bytes={}-", existing))
+                .send()?
+        } else {
+            client.get(url).send()?
+        };
+
+        if !response.status().is_success() {
+            anyhow::bail!("Download failed with status: {}", response.status());
+        }
+
+        if existing > 0 && response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+            // Range requests are not supported; restart from scratch.
+            existing = 0;
+            if temp_path.exists() {
+                fs::remove_file(&temp_path)?;
+            }
+            response = client.get(url).send()?;
+            if !response.status().is_success() {
+                anyhow::bail!("Download failed with status: {}", response.status());
+            }
+        }
+
+        let segment_size = response.content_length().unwrap_or(0);
+        let total_size = expected_size.unwrap_or_else(|| {
+            if segment_size > 0 {
+                existing + segment_size
+            } else {
+                0
+            }
+        });
+
+        let mut file = if existing > 0 {
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&temp_path)?
+        } else {
+            File::create(&temp_path)?
+        };
+
+        let mut downloaded: u64 = existing;
+        progress_callback(downloaded, total_size);
+
+        let mut buffer = [0u8; 8192];
         loop {
             let bytes_read = response.read(&mut buffer)?;
             if bytes_read == 0 {
                 break;
             }
-            
+
             file.write_all(&buffer[..bytes_read])?;
             downloaded += bytes_read as u64;
-            
+
             // Report progress
             progress_callback(downloaded, total_size);
         }
-        
+
+        if let Some(expected) = expected_size {
+            if downloaded < expected {
+                anyhow::bail!("Download incomplete: {} / {} bytes", downloaded, expected);
+            }
+            if downloaded > expected {
+                let _ = fs::remove_file(&temp_path);
+                anyhow::bail!("Download size mismatch: {} / {} bytes", downloaded, expected);
+            }
+        }
+
+        fs::rename(&temp_path, dest_path)?;
         println!("Download complete!");
         Ok(())
     }
@@ -150,7 +240,12 @@ impl RuntimeManager {
     }
 
     /// Download and install Proton-GE with progress callback
-    pub fn install_proton_ge<F>(&self, release: &ProtonRelease, mut progress_callback: F) -> Result<PathBuf>
+    pub fn install_proton_ge<F>(
+        &self,
+        release: &ProtonRelease,
+        reinstall: bool,
+        mut progress_callback: F,
+    ) -> Result<PathBuf>
     where
         F: FnMut(String, f64),  // (status_text, progress_fraction)
     {
@@ -167,21 +262,53 @@ impl RuntimeManager {
 
         let download_path = cache_dir.join(filename);
 
-        // Download if not already cached
-        if !download_path.exists() {
+        let partial_path = cache_dir.join(format!("{}.part", filename));
+        let expected_size = if targz_asset.size > 0 {
+            Some(targz_asset.size)
+        } else {
+            None
+        };
+
+        if reinstall {
+            let _ = fs::remove_file(&download_path);
+            let _ = fs::remove_file(&partial_path);
+        }
+
+        // Download if not already cached (or if size doesn't match)
+        let mut cached_size = 0;
+        if download_path.exists() {
+            cached_size = download_path.metadata()?.len();
+        }
+
+        if !download_path.exists() || expected_size.map(|size| cached_size != size).unwrap_or(false) {
             let total_mb = targz_asset.size / 1_048_576;
             println!("Downloading {} ({} MB)...", filename, total_mb);
-            
-            progress_callback(format!("Downloading {} (0 / {} MB)", filename, total_mb), 0.0);
-            
-            self.download_file(download_url, &download_path, |downloaded, total| {
+
+            let mut resume_bytes = 0;
+            if partial_path.exists() {
+                resume_bytes = partial_path.metadata()?.len();
+            } else if download_path.exists() && expected_size.map(|size| cached_size < size).unwrap_or(false) {
+                resume_bytes = cached_size;
+            }
+
+            if resume_bytes > 0 && targz_asset.size > 0 {
+                let resume_mb = resume_bytes / 1_048_576;
+                progress_callback(
+                    format!("Resuming {} ({} / {} MB)", filename, resume_mb, total_mb),
+                    (resume_bytes as f64 / targz_asset.size as f64) * 0.9,
+                );
+            } else {
+                progress_callback(format!("Downloading {} (0 / {} MB)", filename, total_mb), 0.0);
+            }
+
+            self.download_file(download_url, &download_path, expected_size, |downloaded, total| {
                 if total > 0 {
                     let progress = downloaded as f64 / total as f64;
                     let downloaded_mb = downloaded / 1_048_576;
                     let total_mb = total / 1_048_576;
                     progress_callback(
                         format!("Downloading {} ({} / {} MB)", filename, downloaded_mb, total_mb),
-                        progress * 0.9  // Reserve 10% for extraction
+                        progress * 0.9,  // Reserve 10% for extraction
                     );
                 }
             })?;
@@ -190,20 +317,68 @@ impl RuntimeManager {
             progress_callback(format!("Using cached file: {}", filename), 0.9);
         }
 
-        // Extract to runtimes directory
+        // Extract to staging directory
         fs::create_dir_all(&self.runtimes_dir)?;
-        println!("Extracting to {:?}...", self.runtimes_dir);
-        progress_callback("Extracting archive...".to_string(), 0.95);
-        
-        self.extract_targz(&download_path, &self.runtimes_dir)?;
+        let staging_dir = self
+            .runtimes_dir
+            .join(format!(".staging-{}", release.tag_name));
+        if staging_dir.exists() {
+            fs::remove_dir_all(&staging_dir)?;
+        }
 
-        // Determine extracted directory name (usually same as tag_name)
-        let extracted_dir = self.runtimes_dir.join(&release.tag_name);
-        
+        println!("Extracting to {:?}...", staging_dir);
+        progress_callback("Extracting archive...".to_string(), 0.95);
+
+        if let Err(e) = self.extract_targz(&download_path, &staging_dir) {
+            let _ = fs::remove_dir_all(&staging_dir);
+            return Err(e);
+        }
+
+        let preferred_dir = staging_dir.join(&release.tag_name);
+        let extracted_dir = if preferred_dir.exists() {
+            preferred_dir
+        } else {
+            let mut found_dir = None;
+            for entry in fs::read_dir(&staging_dir)? {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() {
+                    found_dir = Some(entry.path());
+                    break;
+                }
+            }
+            found_dir.unwrap_or_else(|| staging_dir.clone())
+        };
+
+        let extracted_name = if extracted_dir == staging_dir {
+            release.tag_name.clone()
+        } else {
+            extracted_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(&release.tag_name)
+                .to_string()
+        };
+        let final_dir = self.runtimes_dir.join(&extracted_name);
+
+        if final_dir.exists() {
+            if reinstall {
+                fs::remove_dir_all(&final_dir)?;
+            } else {
+                let _ = fs::remove_dir_all(&staging_dir);
+                progress_callback("Proton-GE already installed.".to_string(), 1.0);
+                return Ok(final_dir);
+            }
+        }
+
+        fs::rename(&extracted_dir, &final_dir)?;
+        if staging_dir.exists() {
+            let _ = fs::remove_dir_all(&staging_dir);
+        }
+
         println!("Proton-GE installed successfully!");
         progress_callback("Installation complete!".to_string(), 1.0);
-        
-        Ok(extracted_dir)
+
+        Ok(final_dir)
     }
 
     /// Extract a .tar.gz file
