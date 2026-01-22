@@ -417,6 +417,18 @@ impl RuntimeManager {
         Ok(installed)
     }
 
+    /// Get the path to the latest installed Proton-GE version
+    pub fn latest_installed(&self) -> Result<Option<PathBuf>> {
+        let mut installed = self.list_installed()?;
+        if installed.is_empty() {
+            return Ok(None);
+        }
+
+        installed.sort();
+        let latest = installed.last().cloned().unwrap_or_default();
+        Ok(self.get_proton_path(&latest))
+    }
+
     /// Check if a specific Proton-GE version is installed
     pub fn is_installed(&self, version: &str) -> bool {
         self.runtimes_dir.join(version).exists()

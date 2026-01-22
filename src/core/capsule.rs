@@ -3,10 +3,23 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::fs;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum InstallState {
+    Installing,
+    Installed,
+}
+
+impl Default for InstallState {
+    fn default() -> Self {
+        Self::Installing
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Capsule {
     pub name: String,
-    pub appimage_path: PathBuf,
+    pub capsule_dir: PathBuf,
     pub home_path: PathBuf,
     pub metadata: CapsuleMetadata,
 }
@@ -22,6 +35,10 @@ pub struct CapsuleMetadata {
     pub redistributables_installed: Vec<String>,
     #[serde(default)]
     pub last_played: Option<String>,
+    #[serde(default)]
+    pub installer_path: Option<String>,
+    #[serde(default)]
+    pub install_state: InstallState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,7 +58,7 @@ pub struct ExecutableEntry {
 }
 
 impl Capsule {
-    /// Scan a directory for .AppImage files and load their metadata
+    /// Scan a directory for capsule folders with metadata.json
     pub fn scan_directory(dir: &Path) -> Result<Vec<Capsule>> {
         let mut capsules = Vec::new();
         
@@ -54,8 +71,8 @@ impl Capsule {
             let entry = entry?;
             let path = entry.path();
             
-            if path.extension().and_then(|s| s.to_str()) == Some("AppImage") {
-                if let Ok(capsule) = Self::load_from_appimage(&path) {
+            if path.is_dir() {
+                if let Ok(capsule) = Self::load_from_dir(&path) {
                     capsules.push(capsule);
                 }
             }
@@ -64,58 +81,32 @@ impl Capsule {
         Ok(capsules)
     }
 
-    /// Load capsule information from an AppImage file
-    pub fn load_from_appimage(appimage_path: &Path) -> Result<Capsule> {
-        let home_path = Self::get_home_path(appimage_path);
-        let metadata_path = home_path.join("metadata.json");
+    /// Load capsule information from a capsule directory
+    pub fn load_from_dir(capsule_dir: &Path) -> Result<Capsule> {
+        let metadata_path = capsule_dir.join("metadata.json");
+        let content = fs::read_to_string(&metadata_path)
+            .context("Failed to read metadata.json")?;
+        let metadata: CapsuleMetadata = serde_json::from_str(&content)
+            .context("Failed to parse metadata.json")?;
 
-        let metadata = if metadata_path.exists() {
-            let content = fs::read_to_string(&metadata_path)
-                .context("Failed to read metadata.json")?;
-            serde_json::from_str(&content)
-                .context("Failed to parse metadata.json")?
-        } else {
-            // Create default metadata if none exists
-            let name = appimage_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("Unknown")
-                .to_string();
-            
-            CapsuleMetadata {
-                name: name.clone(),
-                executables: ExecutableConfig {
-                    main: ExecutableEntry {
-                        path: String::new(),
-                        args: String::new(),
-                        label: "Launch".to_string(),
-                        original_shortcut: None,
-                    },
-                    tools: Vec::new(),
-                },
-                wine_version: None,
-                dxvk_enabled: true,
-                vkd3d_enabled: false,
-                env_vars: Vec::new(),
-                redistributables_installed: Vec::new(),
-                last_played: None,
-            }
-        };
+        let name = metadata.name.clone();
+        let home_path = capsule_dir.join(format!("{}.AppImage.home", name));
 
         Ok(Capsule {
-            name: metadata.name.clone(),
-            appimage_path: appimage_path.to_path_buf(),
+            name,
+            capsule_dir: capsule_dir.to_path_buf(),
             home_path,
             metadata,
         })
     }
 
-    /// Get the .home directory path for an AppImage
-    pub fn get_home_path(appimage_path: &Path) -> PathBuf {
-        let mut home = appimage_path.to_path_buf();
-        let name = home.file_name().unwrap().to_str().unwrap();
-        home.set_file_name(format!("{}.home", name));
-        home
+    pub fn save_metadata(&self) -> Result<()> {
+        let metadata_path = self.capsule_dir.join("metadata.json");
+        let content = serde_json::to_string_pretty(&self.metadata)
+            .context("Failed to serialize metadata.json")?;
+        fs::write(&metadata_path, content)
+            .context("Failed to write metadata.json")?;
+        Ok(())
     }
 }
 
@@ -138,6 +129,8 @@ impl Default for CapsuleMetadata {
             env_vars: Vec::new(),
             redistributables_installed: Vec::new(),
             last_played: None,
+            installer_path: None,
+            install_state: InstallState::Installing,
         }
     }
 }

@@ -32,6 +32,7 @@ pub enum CommandKind {
     MesaInstall,
     MesaReinstall,
     MissingPackages,
+    UmuDocs,
 }
 
 pub struct SystemSetupDialog {
@@ -83,6 +84,9 @@ impl SystemSetupDialog {
                     ))
                 }
             }
+            CommandKind::UmuDocs => Some(
+                "https://github.com/Open-Wine-Components/umu-launcher".to_string(),
+            ),
         }
     }
 
@@ -218,12 +222,38 @@ impl SimpleComponent for SystemSetupDialog {
                         },
                     },
 
-                    // Row 3: Proton-GE
+                    // Row 3: UMU Launcher
                     attach[0, 3, 1, 1] = &Label {
-                        set_label: "Proton-GE",
+                        set_label: "UMU Launcher",
                         set_halign: gtk4::Align::Start,
                     },
                     attach[1, 3, 1, 1] = &Label {
+                        #[watch]
+                        set_markup: if model.system_check.umu_installed {
+                            "<span foreground='#2ecc71'>✓ Installed</span>"
+                        } else {
+                            "<span foreground='#e74c3c'>✗ Missing</span>"
+                        },
+                        set_halign: gtk4::Align::Start,
+                    },
+                    attach[2, 3, 1, 1] = &Box {
+                        set_orientation: Orientation::Horizontal,
+                        set_spacing: 10,
+
+                        append = &Button {
+                            #[watch]
+                            set_visible: !model.system_check.umu_installed,
+                            set_label: "Copy install docs",
+                            connect_clicked => SystemSetupMsg::CopyCommand(CommandKind::UmuDocs),
+                        },
+                    },
+
+                    // Row 4: Proton-GE
+                    attach[0, 4, 1, 1] = &Label {
+                        set_label: "Proton-GE",
+                        set_halign: gtk4::Align::Start,
+                    },
+                    attach[1, 4, 1, 1] = &Label {
                         #[watch]
                         set_markup: if model.system_check.proton_installed {
                             "<span foreground='#2ecc71'>✓ Installed</span>"
@@ -232,7 +262,7 @@ impl SimpleComponent for SystemSetupDialog {
                         },
                         set_halign: gtk4::Align::Start,
                     },
-                    attach[2, 3, 1, 1] = &Box {
+                    attach[2, 4, 1, 1] = &Box {
                         set_orientation: Orientation::Horizontal,
                         set_spacing: 10,
 

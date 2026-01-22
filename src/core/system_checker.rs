@@ -14,6 +14,7 @@ pub struct SystemCheck {
     pub vulkan_installed: bool,
     pub mesa_installed: bool,
     pub proton_installed: bool,
+    pub umu_installed: bool,
     pub missing_apt_packages: Vec<String>,
 }
 
@@ -23,6 +24,7 @@ impl SystemCheck {
         let vulkan_installed = Self::check_command("vulkaninfo");
         let mesa_installed = Self::check_mesa();
         let proton_installed = Self::check_proton_ge();
+        let umu_installed = Self::check_command("umu-run");
 
         let mut missing_apt_packages = Vec::new();
         
@@ -43,7 +45,7 @@ impl SystemCheck {
 
         // Determine overall status
         let apt_ok = vulkan_installed && mesa_installed;
-        let runtimes_ok = proton_installed;
+        let runtimes_ok = proton_installed && umu_installed;
 
         let status = if apt_ok && runtimes_ok {
             SystemStatus::AllInstalled
@@ -53,11 +55,30 @@ impl SystemCheck {
             SystemStatus::NothingInstalled
         };
 
+        println!("System check details:");
+        println!("  Vulkan tools: {}", if vulkan_installed { "installed" } else { "missing" });
+        println!("  Mesa drivers: {}", if mesa_installed { "installed" } else { "missing" });
+        println!(
+            "  Proton-GE: {}",
+            if proton_installed { "installed" } else { "missing" }
+        );
+        println!(
+            "  UMU Launcher: {}",
+            if umu_installed { "installed" } else { "missing" }
+        );
+        if missing_apt_packages.is_empty() {
+            println!("  Missing apt packages: none");
+        } else {
+            println!("  Missing apt packages: {}", missing_apt_packages.join(" "));
+        }
+        println!("  Overall status: {:?}", status);
+
         Self {
             status,
             vulkan_installed,
             mesa_installed,
             proton_installed,
+            umu_installed,
             missing_apt_packages,
         }
     }

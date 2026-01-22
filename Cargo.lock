@@ -1095,6 +1095,7 @@ dependencies = [
  "gtk4",
  "hex",
  "indicatif",
+ "libc",
  "relm4",
  "reqwest",
  "serde",
