@@ -1,13 +1,13 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/env sh
+set -eu
 
 REINSTALL=0
-if [[ "${1:-}" == "--reinstall" ]]; then
+if [ "${1:-}" = "--reinstall" ]; then
   REINSTALL=1
 fi
 
 SUDO=""
-if [[ "$(id -u)" -ne 0 ]]; then
+if [ "$(id -u)" -ne 0 ]; then
   if command -v sudo >/dev/null 2>&1; then
     SUDO="sudo"
   else
@@ -26,9 +26,9 @@ else
   exit 1
 fi
 
-APT_FLAGS=()
-if [[ "$REINSTALL" -eq 1 ]]; then
-  APT_FLAGS+=(--reinstall)
+APT_FLAGS=""
+if [ "$REINSTALL" -eq 1 ]; then
+  APT_FLAGS="--reinstall"
 fi
 
 apt_update() {
@@ -36,17 +36,17 @@ apt_update() {
 }
 
 apt_install() {
-  $SUDO "$APT_CMD" install "${APT_FLAGS[@]}" "$@"
+  $SUDO "$APT_CMD" install $APT_FLAGS "$@"
 }
 
-if [[ -f /etc/os-release ]]; then
+if [ -f /etc/os-release ]; then
   . /etc/os-release
 else
   echo "/etc/os-release not found."
   exit 1
 fi
 
-if [[ "${ID:-}" != "debian" && "${ID:-}" != "ubuntu" ]]; then
+if [ "${ID:-}" != "debian" ] && [ "${ID:-}" != "ubuntu" ]; then
   echo "This setup script currently supports Debian/Ubuntu."
   exit 1
 fi
@@ -57,41 +57,24 @@ fi
 
 apt_update
 
-BASE_PACKAGES=(
-  curl
-  ca-certificates
-  python3
-)
+BASE_PACKAGES="curl ca-certificates python3"
+VULKAN_PACKAGES="vulkan-tools libvulkan1 libvulkan1:i386"
+MESA_PACKAGES="mesa-vulkan-drivers mesa-vulkan-drivers:i386 libgl1-mesa-dri:amd64 libgl1-mesa-dri:i386 libglx-mesa0:amd64 libglx-mesa0:i386"
 
-VULKAN_PACKAGES=(
-  vulkan-tools
-  libvulkan1
-  libvulkan1:i386
-)
-
-MESA_PACKAGES=(
-  mesa-vulkan-drivers
-  mesa-vulkan-drivers:i386
-  libgl1-mesa-dri:amd64
-  libgl1-mesa-dri:i386
-  libglx-mesa0:amd64
-  libglx-mesa0:i386
-)
-
-apt_install "${BASE_PACKAGES[@]}"
-apt_install "${VULKAN_PACKAGES[@]}"
-apt_install "${MESA_PACKAGES[@]}"
+apt_install $BASE_PACKAGES
+apt_install $VULKAN_PACKAGES
+apt_install $MESA_PACKAGES
 
 DEBIAN_ARCH="$(dpkg --print-architecture)"
-if [[ "$DEBIAN_ARCH" != "amd64" && "$DEBIAN_ARCH" != "arm64" && "$DEBIAN_ARCH" != "armhf" ]]; then
+if [ "$DEBIAN_ARCH" != "amd64" ] && [ "$DEBIAN_ARCH" != "arm64" ] && [ "$DEBIAN_ARCH" != "armhf" ]; then
   echo "Unsupported architecture: $DEBIAN_ARCH"
   exit 1
 fi
 
-if [[ "${ID}" == "debian" ]]; then
+if [ "${ID}" = "debian" ]; then
   DISTRO_TAG="debian-${VERSION_ID}"
 else
-  if [[ -z "${VERSION_CODENAME:-}" ]]; then
+  if [ -z "${VERSION_CODENAME:-}" ]; then
     echo "Missing VERSION_CODENAME for Ubuntu."
     exit 1
   fi
@@ -135,7 +118,7 @@ print("{}|{}".format(selected["name"], selected["browser_download_url"]))
 '
 )"
 
-if [[ -z "$ASSET_INFO" ]]; then
+if [ -z "$ASSET_INFO" ]; then
   echo "No matching UMU .deb found for ${DISTRO_TAG} (${DEBIAN_ARCH})."
   exit 1
 fi
@@ -154,7 +137,7 @@ apt_install "$UMU_DEB"
 
 rm -rf "$TMP_DIR"
 
-if [[ -f "./Cargo.toml" ]]; then
+if [ -f "./Cargo.toml" ]; then
   if ! command -v cargo >/dev/null 2>&1; then
     echo "cargo not found, installing..."
     apt_install cargo
@@ -163,7 +146,7 @@ if [[ -f "./Cargo.toml" ]]; then
   echo "Building LinuxBoy..."
   cargo build --release
 
-  if [[ -f "target/release/linuxboy" ]]; then
+  if [ -f "target/release/linuxboy" ]; then
     $SUDO install -m 755 target/release/linuxboy /usr/local/bin/linuxboy
     echo "Installed LinuxBoy to /usr/local/bin/linuxboy"
   else
