@@ -28,10 +28,27 @@ pub struct Capsule {
 pub struct CapsuleMetadata {
     pub name: String,
     pub executables: ExecutableConfig,
+    #[serde(default)]
+    pub game_id: Option<String>,
+    #[serde(default)]
+    pub store: Option<String>,
+    #[serde(default)]
+    pub protonfixes_disable: bool,
+    #[serde(default)]
+    pub protonfixes_tricks: Vec<String>,
+    #[serde(default)]
+    pub protonfixes_replace_cmds: Vec<String>,
+    #[serde(default)]
+    pub protonfixes_dxvk_sets: Vec<String>,
     pub wine_version: Option<String>,
     pub dxvk_enabled: bool,
     pub vkd3d_enabled: bool,
     pub env_vars: Vec<(String, String)>,
+    #[serde(default = "default_true")]
+    pub install_vcredist: bool,
+    #[serde(default = "default_true")]
+    pub install_dxweb: bool,
+    #[serde(default)]
     pub redistributables_installed: Vec<String>,
     #[serde(default)]
     pub last_played: Option<String>,
@@ -123,14 +140,26 @@ impl Default for CapsuleMetadata {
                 },
                 tools: Vec::new(),
             },
+            game_id: None,
+            store: None,
+            protonfixes_disable: false,
+            protonfixes_tricks: Vec::new(),
+            protonfixes_replace_cmds: Vec::new(),
+            protonfixes_dxvk_sets: Vec::new(),
             wine_version: None,
             dxvk_enabled: true,
             vkd3d_enabled: false,
             env_vars: Vec::new(),
+            install_vcredist: true,
+            install_dxweb: true,
             redistributables_installed: Vec::new(),
             last_played: None,
             installer_path: None,
             install_state: InstallState::Installing,
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }

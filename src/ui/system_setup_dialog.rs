@@ -464,6 +464,71 @@ impl SimpleComponent for SystemSetupDialog {
                             },
                         },
                     },
+
+                    // Optional dependency cache
+                    append = &Box {
+                        set_orientation: Orientation::Horizontal,
+                        set_spacing: 12,
+                        set_hexpand: true,
+                        set_css_classes: &["card", "setup-row"],
+
+                        append = &Image {
+                            set_icon_name: Some("folder-download-symbolic"),
+                            set_pixel_size: 24,
+                        },
+
+                        append = &Box {
+                            set_orientation: Orientation::Vertical,
+                            set_spacing: 6,
+                            set_hexpand: true,
+
+                            append = &Label {
+                                set_label: "Dependency Cache (Optional)",
+                                set_css_classes: &["card-title"],
+                                set_halign: gtk4::Align::Start,
+                            },
+
+                            append = &Label {
+                                set_label: "Pre-download VC++ and DirectX installers for post-install steps.",
+                                set_css_classes: &["muted"],
+                                set_halign: gtk4::Align::Start,
+                                set_wrap: true,
+                            },
+                        },
+
+                        append = &Box {
+                            set_orientation: Orientation::Vertical,
+                            set_spacing: 6,
+                            set_halign: gtk4::Align::End,
+                            set_valign: gtk4::Align::Center,
+
+                            append = &Label {
+                                #[watch]
+                                set_markup: if model.system_check.vcredist_cached {
+                                    "<span foreground='#2ecc71'>✓ VC++ AIO cached</span>"
+                                } else {
+                                    "<span foreground='#f39c12'>✗ VC++ AIO missing</span>"
+                                },
+                                set_halign: gtk4::Align::End,
+                            },
+
+                            append = &Label {
+                                #[watch]
+                                set_markup: if model.system_check.dxweb_cached {
+                                    "<span foreground='#2ecc71'>✓ DirectX cached</span>"
+                                } else {
+                                    "<span foreground='#f39c12'>✗ DirectX missing</span>"
+                                },
+                                set_halign: gtk4::Align::End,
+                            },
+
+                            append = &Button {
+                                set_label: "Copy setup cmd",
+                                set_css_classes: &["secondary"],
+                                connect_clicked => SystemSetupMsg::CopySetupScript { reinstall: false },
+                            },
+                        },
+                    },
                 },
 
                 // Missing APT packages section

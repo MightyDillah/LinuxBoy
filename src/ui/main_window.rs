@@ -1,18 +1,18 @@
 use gtk4::prelude::*;
 use gtk4::{
-    ApplicationWindow, Box, Button, Dialog, Entry, FileChooserAction, FileChooserNative,
-    FileFilter, Image, Label, Orientation, ResponseType, ScrolledWindow,
+    ApplicationWindow, Box, Button, CheckButton, Dialog, Entry, FileChooserAction,
+    FileChooserNative, FileFilter, Image, Label, ListBox, ListBoxRow, Orientation, ResponseType,
+    ScrolledWindow, SelectionMode,
 };
 use relm4::{Component, ComponentParts, ComponentSender, RelmWidgetExt, SimpleComponent};
 use relm4::component::{ComponentController, Controller};
 
-use crate::core::capsule::{
-    Capsule, CapsuleMetadata, InstallState,
-};
+use crate::core::capsule::{Capsule, CapsuleMetadata, InstallState};
 use crate::core::runtime_manager::RuntimeManager;
 use crate::core::system_checker::{SystemCheck, SystemStatus};
+use crate::core::umu_database::{UmuDatabase, UmuEntry};
 use crate::ui::system_setup_dialog::{SystemSetupDialog, SystemSetupMsg, SystemSetupOutput};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
@@ -26,14 +26,45 @@ pub enum MainWindowMsg {
     InstallerSelected(PathBuf),
     InstallerCancelled,
     GameNameConfirmed(String),
+    InstallerStarted {
+        capsule_dir: PathBuf,
+        pgid: i32,
+    },
     InstallerFinished {
         capsule_dir: PathBuf,
         success: bool,
     },
-    SelectExecutable {
-        capsule_dir: PathBuf,
-        exe_path: PathBuf,
+    UmuDatabaseLoaded(Vec<UmuEntry>),
+    UmuDatabaseFailed(String),
+    UmuMatchChosen {
+        game_id: Option<String>,
+        store: Option<String>,
     },
+    UmuMatchDialogClosed,
+    SaveGameSettings {
+        capsule_dir: PathBuf,
+        exe_path: String,
+        game_id: Option<String>,
+        store: Option<String>,
+        install_vcredist: bool,
+        install_dxweb: bool,
+        protonfixes_disable: bool,
+        protonfixes_tricks: Vec<String>,
+        protonfixes_replace_cmds: Vec<String>,
+        protonfixes_dxvk_sets: Vec<String>,
+    },
+    SettingsDialogClosed,
+    DependenciesSelected {
+        capsule_dir: PathBuf,
+        install_vcredist: bool,
+        install_dxweb: bool,
+        force: bool,
+    },
+    DependenciesFinished {
+        capsule_dir: PathBuf,
+        installed: Vec<String>,
+    },
+    DependenciesDialogClosed,
     EditGame(PathBuf),
     DeleteGame(PathBuf),
     ResumeInstall(PathBuf),
@@ -49,14 +80,137 @@ pub struct MainWindow {
     runtime_mgr: RuntimeManager,
     installer_dialog: Option<FileChooserNative>,
     name_dialog: Option<Dialog>,
+    settings_dialog: Option<Dialog>,
+    umu_match_dialog: Option<Dialog>,
+    dependency_dialog: Option<Dialog>,
     pending_installer_path: Option<PathBuf>,
+    pending_game_name: Option<String>,
+    pending_settings_capsule: Option<PathBuf>,
     active_installs: HashMap<PathBuf, i32>,
+    preparing_installs: HashSet<PathBuf>,
+    dependency_installs: HashSet<PathBuf>,
+    umu_entries: Vec<UmuEntry>,
+    umu_loaded: bool,
+    umu_load_error: Option<String>,
     games_list: Box,
     library_count_label: Label,
     root_window: ApplicationWindow,
 }
 
+#[derive(Debug, Clone)]
+struct UmuMatch {
+    entry: UmuEntry,
+    score: i32,
+}
+
 impl MainWindow {
+    const DEP_VCREDIST: &'static str = "vcredist";
+    const DEP_DXWEB: &'static str = "dxweb";
+
+    fn normalize_words(value: &str) -> Vec<String> {
+        let mut words = Vec::new();
+        let mut current = String::new();
+        for ch in value.chars() {
+            if ch.is_ascii_alphanumeric() {
+                current.push(ch.to_ascii_lowercase());
+            } else if !current.is_empty() {
+                words.push(current);
+                current = String::new();
+            }
+        }
+        if !current.is_empty() {
+            words.push(current);
+        }
+        words
+    }
+
+    fn score_match(input: &str, candidate: &str) -> Option<i32> {
+        let input_compact = UmuDatabase::normalize_title(input);
+        let candidate_compact = UmuDatabase::normalize_title(candidate);
+        if input_compact.is_empty() || candidate_compact.is_empty() {
+            return None;
+        }
+
+        if candidate_compact == input_compact {
+            return Some(0);
+        }
+
+        if candidate_compact.contains(&input_compact) {
+            return Some(1);
+        }
+
+        let input_words = Self::normalize_words(input);
+        let candidate_words = Self::normalize_words(candidate);
+        if !input_words.is_empty()
+            && input_words
+                .iter()
+                .all(|word| candidate_words.contains(word))
+        {
+            return Some(2);
+        }
+
+        if input_compact.contains(&candidate_compact) && candidate_compact.len() >= 4 {
+            return Some(3);
+        }
+
+        None
+    }
+
+    fn score_acronym(input: &str, acronym: &str) -> Option<i32> {
+        let input_compact = UmuDatabase::normalize_title(input);
+        let acronym_compact = UmuDatabase::normalize_title(acronym);
+        if input_compact.is_empty() || acronym_compact.is_empty() {
+            return None;
+        }
+
+        if input_compact == acronym_compact {
+            return Some(0);
+        }
+
+        if input_compact.contains(&acronym_compact) && acronym_compact.len() >= 3 {
+            return Some(2);
+        }
+
+        None
+    }
+
+    fn parse_list_input(value: &str) -> Vec<String> {
+        value
+            .split(|ch: char| ch.is_whitespace() || ch == ',' || ch == ';')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn vcredist_cache_path() -> PathBuf {
+        SystemCheck::vcredist_cache_path()
+    }
+
+    fn dxweb_cache_path() -> PathBuf {
+        SystemCheck::dxweb_cache_path()
+    }
+
+    fn is_dependency_installed(metadata: &CapsuleMetadata, dep: &str) -> bool {
+        metadata
+            .redistributables_installed
+            .iter()
+            .any(|item| item == dep)
+    }
+
+    fn should_prompt_dependencies(&self, metadata: &CapsuleMetadata) -> bool {
+        let wants_vcredist = metadata.install_vcredist;
+        let wants_dxweb = metadata.install_dxweb;
+        if !wants_vcredist && !wants_dxweb {
+            return false;
+        }
+        let vcredist_pending =
+            wants_vcredist && !Self::is_dependency_installed(metadata, Self::DEP_VCREDIST);
+        let dxweb_pending =
+            wants_dxweb && !Self::is_dependency_installed(metadata, Self::DEP_DXWEB);
+        vcredist_pending || dxweb_pending
+    }
+
     fn update_library_labels(&self) {
         self.library_count_label
             .set_label(&format!("{} games", self.capsules.len()));
@@ -171,37 +325,704 @@ impl MainWindow {
         self.name_dialog = Some(dialog);
     }
 
-    fn open_exe_dialog(&self, sender: ComponentSender<Self>, capsule_dir: PathBuf) {
-        let dialog = FileChooserNative::builder()
-            .title("Select Game Executable")
-            .action(FileChooserAction::Open)
-            .accept_label("Select")
-            .cancel_label("Cancel")
+    fn start_umu_db_sync(sender: ComponentSender<Self>) {
+        thread::spawn(move || match UmuDatabase::load_or_fetch() {
+            Ok(entries) => sender.input(MainWindowMsg::UmuDatabaseLoaded(entries)),
+            Err(e) => sender.input(MainWindowMsg::UmuDatabaseFailed(e.to_string())),
+        });
+    }
+
+    fn open_umu_match_dialog(
+        &mut self,
+        sender: ComponentSender<Self>,
+        game_name: String,
+        matches: Vec<UmuMatch>,
+    ) {
+        if self.umu_match_dialog.is_some() {
+            return;
+        }
+
+        let dialog = Dialog::builder()
+            .title("Match UMU Game")
+            .modal(true)
             .transient_for(&self.root_window)
             .build();
+        dialog.add_button("Skip", ResponseType::Cancel);
+        dialog.add_button("Use Selection", ResponseType::Accept);
 
-        let filter = FileFilter::new();
-        filter.add_suffix("exe");
-        filter.set_name(Some("Windows executables (.exe)"));
-        dialog.add_filter(&filter);
+        let content = dialog.content_area();
+        let layout = Box::new(Orientation::Vertical, 8);
+        layout.set_margin_all(12);
+
+        let title = Label::new(Some(&format!(
+            "Select the UMU match for \"{}\"",
+            game_name
+        )));
+        title.set_halign(gtk4::Align::Start);
+        title.set_wrap(true);
+        title.set_css_classes(&["section-title"]);
+
+        let hint = Label::new(Some(
+            "Pick the correct storefront entry. If none match, click Skip.",
+        ));
+        hint.set_halign(gtk4::Align::Start);
+        hint.set_wrap(true);
+        hint.set_css_classes(&["muted"]);
+
+        let listbox = ListBox::new();
+        listbox.set_selection_mode(SelectionMode::Single);
+
+        for candidate in &matches {
+            let entry = &candidate.entry;
+            let row = ListBoxRow::new();
+            let row_box = Box::new(Orientation::Vertical, 4);
+            row_box.set_margin_all(8);
+
+            let title_text = entry.title.as_deref().unwrap_or("Unknown title");
+            let title_label = Label::new(Some(title_text));
+            title_label.set_halign(gtk4::Align::Start);
+            title_label.set_wrap(true);
+            title_label.set_css_classes(&["card-title"]);
+
+            let umu_id = entry.umu_id.as_deref().unwrap_or("unknown");
+            let store = entry.store.as_deref().unwrap_or("unknown");
+            let codename = entry.codename.as_deref().unwrap_or("unknown");
+            let detail_text = format!("UMU ID: {umu_id} • Store: {store} • Codename: {codename}");
+            let detail_label = Label::new(Some(&detail_text));
+            detail_label.set_halign(gtk4::Align::Start);
+            detail_label.set_wrap(true);
+            detail_label.set_css_classes(&["muted"]);
+
+            row_box.append(&title_label);
+            row_box.append(&detail_label);
+
+            if let Some(notes) = entry.notes.as_deref() {
+                if !notes.trim().is_empty() {
+                    let notes_label = Label::new(Some(notes));
+                    notes_label.set_halign(gtk4::Align::Start);
+                    notes_label.set_wrap(true);
+                    notes_label.set_css_classes(&["muted"]);
+                    row_box.append(&notes_label);
+                }
+            }
+
+            row.set_child(Some(&row_box));
+            listbox.append(&row);
+        }
+
+        if let Some(first_row) = listbox.row_at_index(0) {
+            listbox.select_row(Some(&first_row));
+        }
+
+        let scroller = ScrolledWindow::new();
+        scroller.set_vexpand(true);
+        scroller.set_child(Some(&listbox));
+
+        layout.append(&title);
+        layout.append(&hint);
+        layout.append(&scroller);
+        content.append(&layout);
 
         let sender_clone = sender.clone();
+        let matches_clone = matches.clone();
         dialog.connect_response(move |dialog, response| {
             if response == ResponseType::Accept {
-                if let Some(file) = dialog.file() {
-                    if let Some(path) = file.path() {
-                        sender_clone.input(MainWindowMsg::SelectExecutable {
-                            capsule_dir: capsule_dir.clone(),
-                            exe_path: path,
+                if let Some(row) = listbox.selected_row() {
+                    let index = row.index();
+                    if index >= 0 {
+                        if let Some(selected) = matches_clone.get(index as usize) {
+                            sender_clone.input(MainWindowMsg::UmuMatchChosen {
+                                game_id: selected.entry.umu_id.clone(),
+                                store: selected.entry.store.clone(),
+                            });
+                        } else {
+                            sender_clone.input(MainWindowMsg::UmuMatchChosen {
+                                game_id: None,
+                                store: None,
+                            });
+                        }
+                    } else {
+                        sender_clone.input(MainWindowMsg::UmuMatchChosen {
+                            game_id: None,
+                            store: None,
                         });
+                    }
+                } else {
+                    sender_clone.input(MainWindowMsg::UmuMatchChosen {
+                        game_id: None,
+                        store: None,
+                    });
+                }
+            } else {
+                sender_clone.input(MainWindowMsg::UmuMatchChosen {
+                    game_id: None,
+                    store: None,
+                });
+            }
+
+            sender_clone.input(MainWindowMsg::UmuMatchDialogClosed);
+            dialog.close();
+        });
+
+        dialog.show();
+        self.umu_match_dialog = Some(dialog);
+    }
+
+    fn open_dependency_dialog(
+        &mut self,
+        sender: ComponentSender<Self>,
+        capsule_dir: PathBuf,
+        metadata: CapsuleMetadata,
+    ) {
+        if self.dependency_dialog.is_some() {
+            return;
+        }
+
+        let vcredist_cached = Self::vcredist_cache_path().is_file();
+        let dxweb_cached = Self::dxweb_cache_path().is_file();
+
+        let dialog = Dialog::builder()
+            .title("Install Dependencies")
+            .modal(true)
+            .transient_for(&self.root_window)
+            .build();
+        dialog.add_button("Skip", ResponseType::Cancel);
+        dialog.add_button("Install", ResponseType::Accept);
+
+        let content = dialog.content_area();
+        let layout = Box::new(Orientation::Vertical, 8);
+        layout.set_margin_all(12);
+
+        let title = Label::new(Some("Install optional dependencies?"));
+        title.set_halign(gtk4::Align::Start);
+        title.set_wrap(true);
+        title.set_css_classes(&["section-title"]);
+
+        let hint = Label::new(Some(
+            "These installers are cached by linuxboy-setup.sh. Disable any you don't want.",
+        ));
+        hint.set_halign(gtk4::Align::Start);
+        hint.set_wrap(true);
+        hint.set_css_classes(&["muted"]);
+
+        let vcredist_row = Box::new(Orientation::Vertical, 4);
+        let vcredist_check = CheckButton::with_label("VC++ Redistributables (AIO)");
+        vcredist_check.set_active(metadata.install_vcredist && vcredist_cached);
+        vcredist_check.set_sensitive(vcredist_cached);
+        let vcredist_status = Label::new(Some(if vcredist_cached {
+            "Cached"
+        } else {
+            "Not downloaded (run setup script)"
+        }));
+        vcredist_status.set_halign(gtk4::Align::Start);
+        vcredist_status.set_css_classes(&["muted"]);
+        vcredist_row.append(&vcredist_check);
+        vcredist_row.append(&vcredist_status);
+
+        let dxweb_row = Box::new(Orientation::Vertical, 4);
+        let dxweb_check = CheckButton::with_label("DirectX Web Installer");
+        dxweb_check.set_active(metadata.install_dxweb && dxweb_cached);
+        dxweb_check.set_sensitive(dxweb_cached);
+        let dxweb_status = Label::new(Some(if dxweb_cached {
+            "Cached"
+        } else {
+            "Not downloaded (run setup script)"
+        }));
+        dxweb_status.set_halign(gtk4::Align::Start);
+        dxweb_status.set_css_classes(&["muted"]);
+        dxweb_row.append(&dxweb_check);
+        dxweb_row.append(&dxweb_status);
+
+        layout.append(&title);
+        layout.append(&hint);
+        layout.append(&vcredist_row);
+        layout.append(&dxweb_row);
+        content.append(&layout);
+
+        let sender_clone = sender.clone();
+        let capsule_dir_clone = capsule_dir.clone();
+        let vcredist_check_clone = vcredist_check.clone();
+        let dxweb_check_clone = dxweb_check.clone();
+        dialog.connect_response(move |dialog, response| {
+            if response == ResponseType::Accept {
+                sender_clone.input(MainWindowMsg::DependenciesSelected {
+                    capsule_dir: capsule_dir_clone.clone(),
+                    install_vcredist: vcredist_check_clone.is_active(),
+                    install_dxweb: dxweb_check_clone.is_active(),
+                    force: false,
+                });
+            }
+            sender_clone.input(MainWindowMsg::DependenciesDialogClosed);
+            dialog.close();
+        });
+
+        dialog.show();
+        self.dependency_dialog = Some(dialog);
+    }
+
+    fn start_dependency_install(
+        &mut self,
+        sender: ComponentSender<Self>,
+        capsule_dir: PathBuf,
+        metadata: CapsuleMetadata,
+        install_vcredist: bool,
+        install_dxweb: bool,
+        force: bool,
+    ) {
+        if !Self::has_command("umu-run") {
+            eprintln!("umu-run not found in PATH");
+            return;
+        }
+
+        let proton_path = match self.runtime_mgr.latest_installed() {
+            Ok(Some(path)) => path,
+            Ok(None) => {
+                eprintln!("No Proton-GE runtime installed");
+                return;
+            }
+            Err(e) => {
+                eprintln!("Failed to resolve Proton-GE runtime: {}", e);
+                return;
+            }
+        };
+
+        let home_path = capsule_dir.join(format!("{}.AppImage.home", metadata.name));
+        let prefix_path = home_path.join("prefix");
+
+        let mut tasks: Vec<(&'static str, PathBuf)> = Vec::new();
+        if install_vcredist && (force || !Self::is_dependency_installed(&metadata, Self::DEP_VCREDIST))
+        {
+            let path = Self::vcredist_cache_path();
+            if path.is_file() {
+                tasks.push((Self::DEP_VCREDIST, path));
+            } else {
+                eprintln!("VC++ installer not cached; run linuxboy-setup.sh");
+            }
+        }
+
+        if install_dxweb && (force || !Self::is_dependency_installed(&metadata, Self::DEP_DXWEB)) {
+            let path = Self::dxweb_cache_path();
+            if path.is_file() {
+                tasks.push((Self::DEP_DXWEB, path));
+            } else {
+                eprintln!("DirectX installer not cached; run linuxboy-setup.sh");
+            }
+        }
+
+        if tasks.is_empty() {
+            return;
+        }
+
+        self.dependency_installs.insert(capsule_dir.clone());
+        self.rebuild_games_list(sender.clone());
+
+        let sender_clone = sender.clone();
+        thread::spawn(move || {
+            let mut installed: Vec<String> = Vec::new();
+            for (dep, path) in tasks {
+                let mut cmd = Self::umu_base_command(&prefix_path, &proton_path, &metadata);
+                cmd.arg(&path);
+                match cmd.status() {
+                    Ok(status) if status.success() => {
+                        installed.push(dep.to_string());
+                    }
+                    Ok(_) => {
+                        eprintln!("Dependency installer failed: {:?}", path);
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to run dependency installer {:?}: {}", path, e);
                     }
                 }
             }
 
-            dialog.destroy();
+            let _ = sender_clone.input(MainWindowMsg::DependenciesFinished {
+                capsule_dir,
+                installed,
+            });
+        });
+    }
+
+    fn finalize_pending_game(
+        &mut self,
+        sender: ComponentSender<Self>,
+        game_id: Option<String>,
+        store: Option<String>,
+    ) {
+        let installer_path = match self.pending_installer_path.take() {
+            Some(path) => path,
+            None => {
+                eprintln!("No installer path selected");
+                self.pending_game_name = None;
+                return;
+            }
+        };
+
+        let name = match self.pending_game_name.take() {
+            Some(name) => name,
+            None => {
+                eprintln!("No pending game name available");
+                return;
+            }
+        };
+
+        if let Err(e) = fs::create_dir_all(&self.games_dir) {
+            eprintln!("Failed to create games directory: {}", e);
+            return;
+        }
+
+        let capsule_dir = self.unique_game_dir(&name);
+        if let Err(e) = fs::create_dir_all(&capsule_dir) {
+            eprintln!("Failed to create capsule directory: {}", e);
+            return;
+        }
+
+        let mut metadata = CapsuleMetadata::default();
+        metadata.name = name.clone();
+        metadata.installer_path = Some(installer_path.to_string_lossy().to_string());
+        metadata.install_state = InstallState::Installing;
+        metadata.game_id = game_id;
+        metadata.store = store;
+
+        self.start_installer(&sender, capsule_dir, metadata, installer_path);
+        sender.input(MainWindowMsg::LoadCapsules);
+    }
+
+    fn find_umu_matches(&self, title: &str) -> Vec<UmuMatch> {
+        if !self.umu_loaded || self.umu_entries.is_empty() {
+            return Vec::new();
+        }
+
+        let normalized_input = UmuDatabase::normalize_title(title);
+        if normalized_input.is_empty() {
+            return Vec::new();
+        }
+
+        let mut matches: Vec<UmuMatch> = Vec::new();
+        for entry in &self.umu_entries {
+            let mut best_score: Option<i32> = None;
+            if let Some(entry_title) = entry.title.as_deref() {
+                if let Some(score) = Self::score_match(title, entry_title) {
+                    best_score = Some(score);
+                }
+            }
+            if let Some(acronym) = entry.acronym.as_deref() {
+                if let Some(score) = Self::score_acronym(title, acronym) {
+                    best_score = Some(best_score.map_or(score, |current| current.min(score)));
+                }
+            }
+            if let Some(score) = best_score {
+                matches.push(UmuMatch {
+                    entry: entry.clone(),
+                    score,
+                });
+            }
+        }
+
+        if matches.is_empty() {
+            return matches;
+        }
+
+        let mut seen = HashSet::new();
+        matches.retain(|candidate| {
+            let key = (
+                candidate.entry.umu_id.clone().unwrap_or_default(),
+                candidate.entry.store.clone().unwrap_or_default(),
+                candidate.entry.codename.clone().unwrap_or_default(),
+            );
+            seen.insert(key)
+        });
+
+        matches.sort_by(|a, b| {
+            a.score
+                .cmp(&b.score)
+                .then_with(|| {
+                    let a_title = a.entry.title.as_deref().unwrap_or("");
+                    let b_title = b.entry.title.as_deref().unwrap_or("");
+                    a_title.len().cmp(&b_title.len())
+                })
+                .then_with(|| {
+                    let a_title = a.entry.title.as_deref().unwrap_or("");
+                    let b_title = b.entry.title.as_deref().unwrap_or("");
+                    a_title.cmp(b_title)
+                })
+                .then_with(|| {
+                    let a_store = a.entry.store.as_deref().unwrap_or("");
+                    let b_store = b.entry.store.as_deref().unwrap_or("");
+                    a_store.cmp(b_store)
+                })
+        });
+
+        matches.truncate(20);
+        matches
+    }
+
+    fn open_game_settings_dialog(&mut self, sender: ComponentSender<Self>, capsule_dir: PathBuf) {
+        if self.settings_dialog.is_some() {
+            return;
+        }
+
+        let capsule = match Capsule::load_from_dir(&capsule_dir) {
+            Ok(capsule) => capsule,
+            Err(e) => {
+                eprintln!("Failed to load capsule: {}", e);
+                return;
+            }
+        };
+
+        let dialog = Dialog::builder()
+            .title("Game Settings")
+            .modal(true)
+            .transient_for(&self.root_window)
+            .build();
+        dialog.add_button("Cancel", ResponseType::Cancel);
+        dialog.add_button("Save", ResponseType::Accept);
+
+        let content = dialog.content_area();
+        let layout = Box::new(Orientation::Vertical, 8);
+        layout.set_margin_all(12);
+
+        let exe_label = Label::new(Some("Executable"));
+        exe_label.set_halign(gtk4::Align::Start);
+
+        let exe_row = Box::new(Orientation::Horizontal, 8);
+        exe_row.set_hexpand(true);
+
+        let exe_entry = Entry::new();
+        exe_entry.set_hexpand(true);
+        exe_entry.set_placeholder_text(Some("Path to game executable (.exe)"));
+        if !capsule.metadata.executables.main.path.trim().is_empty() {
+            exe_entry.set_text(&capsule.metadata.executables.main.path);
+        }
+
+        let exe_entry_clone = exe_entry.clone();
+        let root_window = self.root_window.clone();
+        let browse_button = Button::with_label("Browse");
+        browse_button.connect_clicked(move |_| {
+            let dialog = FileChooserNative::builder()
+                .title("Select Game Executable")
+                .action(FileChooserAction::Open)
+                .accept_label("Select")
+                .cancel_label("Cancel")
+                .transient_for(&root_window)
+                .build();
+
+            let filter = FileFilter::new();
+            filter.add_suffix("exe");
+            filter.set_name(Some("Windows executables (.exe)"));
+            dialog.add_filter(&filter);
+
+            let exe_entry_inner = exe_entry_clone.clone();
+            dialog.connect_response(move |dialog, response| {
+                if response == ResponseType::Accept {
+                    if let Some(file) = dialog.file() {
+                        if let Some(path) = file.path() {
+                            exe_entry_inner.set_text(&path.to_string_lossy());
+                        }
+                    }
+                }
+                dialog.destroy();
+            });
+
+            dialog.show();
+        });
+
+        exe_row.append(&exe_entry);
+        exe_row.append(&browse_button);
+
+        let game_id_label = Label::new(Some("UMU Game ID (optional)"));
+        game_id_label.set_halign(gtk4::Align::Start);
+        let game_id_entry = Entry::new();
+        game_id_entry.set_placeholder_text(Some("e.g., umu-starcitizen"));
+        if let Some(game_id) = &capsule.metadata.game_id {
+            game_id_entry.set_text(game_id);
+        }
+
+        let store_label = Label::new(Some("Store (optional)"));
+        store_label.set_halign(gtk4::Align::Start);
+        let store_entry = Entry::new();
+        store_entry.set_placeholder_text(Some("e.g., steam, gog, egs, none"));
+        if let Some(store) = &capsule.metadata.store {
+            store_entry.set_text(store);
+        }
+
+        let deps_title = Label::new(Some("Dependencies"));
+        deps_title.set_halign(gtk4::Align::Start);
+        deps_title.set_css_classes(&["section-title"]);
+        let deps_hint = Label::new(Some(
+            "Requires cached installers from linuxboy-setup.sh.",
+        ));
+        deps_hint.set_halign(gtk4::Align::Start);
+        deps_hint.set_wrap(true);
+        deps_hint.set_css_classes(&["muted"]);
+
+        let vcredist_check = CheckButton::with_label("Install VC++ Redistributables (AIO)");
+        vcredist_check.set_active(capsule.metadata.install_vcredist);
+        let dxweb_check = CheckButton::with_label("Install DirectX Web Setup");
+        dxweb_check.set_active(capsule.metadata.install_dxweb);
+
+        let install_deps_button = Button::with_label("Install dependencies now");
+        install_deps_button.add_css_class("suggested-action");
+
+        let pf_title = Label::new(Some("Protonfixes Overrides"));
+        pf_title.set_halign(gtk4::Align::Start);
+        pf_title.set_css_classes(&["section-title"]);
+
+        let pf_disable = CheckButton::with_label("Disable Protonfixes for this game");
+        pf_disable.set_active(capsule.metadata.protonfixes_disable);
+
+        let pf_tricks_label = Label::new(Some("Winetricks / Protontricks verbs"));
+        pf_tricks_label.set_halign(gtk4::Align::Start);
+        let pf_tricks_entry = Entry::new();
+        pf_tricks_entry.set_placeholder_text(Some("xliveless d3dcompiler_47"));
+        if !capsule.metadata.protonfixes_tricks.is_empty() {
+            pf_tricks_entry.set_text(&capsule.metadata.protonfixes_tricks.join(" "));
+        }
+
+        let pf_replace_label = Label::new(Some("Command replacements"));
+        pf_replace_label.set_halign(gtk4::Align::Start);
+        let pf_replace_entry = Entry::new();
+        pf_replace_entry.set_placeholder_text(Some("/launcher.exe=/game.exe"));
+        if !capsule.metadata.protonfixes_replace_cmds.is_empty() {
+            pf_replace_entry.set_text(&capsule.metadata.protonfixes_replace_cmds.join(" "));
+        }
+
+        let pf_dxvk_label = Label::new(Some("DXVK options"));
+        pf_dxvk_label.set_halign(gtk4::Align::Start);
+        let pf_dxvk_entry = Entry::new();
+        pf_dxvk_entry.set_placeholder_text(Some("dxgi.maxFrameRate=60"));
+        if !capsule.metadata.protonfixes_dxvk_sets.is_empty() {
+            pf_dxvk_entry.set_text(&capsule.metadata.protonfixes_dxvk_sets.join(" "));
+        }
+
+        layout.append(&exe_label);
+        layout.append(&exe_row);
+        layout.append(&game_id_label);
+        layout.append(&game_id_entry);
+        layout.append(&store_label);
+        layout.append(&store_entry);
+        layout.append(&deps_title);
+        layout.append(&deps_hint);
+        layout.append(&vcredist_check);
+        layout.append(&dxweb_check);
+        layout.append(&install_deps_button);
+        layout.append(&pf_title);
+        layout.append(&pf_disable);
+        layout.append(&pf_tricks_label);
+        layout.append(&pf_tricks_entry);
+        layout.append(&pf_replace_label);
+        layout.append(&pf_replace_entry);
+        layout.append(&pf_dxvk_label);
+        layout.append(&pf_dxvk_entry);
+        content.append(&layout);
+
+        let sender_clone = sender.clone();
+        let capsule_dir_clone = capsule_dir.clone();
+        let exe_entry_clone = exe_entry.clone();
+        let game_id_entry_clone = game_id_entry.clone();
+        let store_entry_clone = store_entry.clone();
+        let vcredist_check_clone = vcredist_check.clone();
+        let dxweb_check_clone = dxweb_check.clone();
+        let pf_disable_clone = pf_disable.clone();
+        let pf_tricks_entry_clone = pf_tricks_entry.clone();
+        let pf_replace_entry_clone = pf_replace_entry.clone();
+        let pf_dxvk_entry_clone = pf_dxvk_entry.clone();
+        dialog.connect_response(move |dialog, response| {
+            if response == ResponseType::Accept {
+                let exe_path = exe_entry_clone.text().to_string();
+                let game_id_text = game_id_entry_clone.text().trim().to_string();
+                let store_text = store_entry_clone.text().trim().to_string();
+                let install_vcredist = vcredist_check_clone.is_active();
+                let install_dxweb = dxweb_check_clone.is_active();
+                let protonfixes_disable = pf_disable_clone.is_active();
+                let protonfixes_tricks = MainWindow::parse_list_input(&pf_tricks_entry_clone.text());
+                let protonfixes_replace_cmds =
+                    MainWindow::parse_list_input(&pf_replace_entry_clone.text());
+                let protonfixes_dxvk_sets = MainWindow::parse_list_input(&pf_dxvk_entry_clone.text());
+                let game_id = if game_id_text.is_empty() {
+                    None
+                } else {
+                    Some(game_id_text)
+                };
+                let store = if store_text.is_empty() {
+                    None
+                } else {
+                    Some(store_text)
+                };
+                sender_clone.input(MainWindowMsg::SaveGameSettings {
+                    capsule_dir: capsule_dir_clone.clone(),
+                    exe_path,
+                    game_id,
+                    store,
+                    install_vcredist,
+                    install_dxweb,
+                    protonfixes_disable,
+                    protonfixes_tricks,
+                    protonfixes_replace_cmds,
+                    protonfixes_dxvk_sets,
+                });
+            }
+
+            sender_clone.input(MainWindowMsg::SettingsDialogClosed);
+            dialog.close();
+        });
+
+        let sender_clone = sender.clone();
+        let capsule_dir_clone = capsule_dir.clone();
+        let exe_entry_clone = exe_entry.clone();
+        let game_id_entry_clone = game_id_entry.clone();
+        let store_entry_clone = store_entry.clone();
+        let vcredist_check_clone = vcredist_check.clone();
+        let dxweb_check_clone = dxweb_check.clone();
+        let pf_disable_clone = pf_disable.clone();
+        let pf_tricks_entry_clone = pf_tricks_entry.clone();
+        let pf_replace_entry_clone = pf_replace_entry.clone();
+        let pf_dxvk_entry_clone = pf_dxvk_entry.clone();
+        let dialog_clone = dialog.clone();
+        install_deps_button.connect_clicked(move |_| {
+            let exe_path = exe_entry_clone.text().to_string();
+            let game_id_text = game_id_entry_clone.text().trim().to_string();
+            let store_text = store_entry_clone.text().trim().to_string();
+            let install_vcredist = vcredist_check_clone.is_active();
+            let install_dxweb = dxweb_check_clone.is_active();
+            let protonfixes_disable = pf_disable_clone.is_active();
+            let protonfixes_tricks = MainWindow::parse_list_input(&pf_tricks_entry_clone.text());
+            let protonfixes_replace_cmds =
+                MainWindow::parse_list_input(&pf_replace_entry_clone.text());
+            let protonfixes_dxvk_sets = MainWindow::parse_list_input(&pf_dxvk_entry_clone.text());
+            let game_id = if game_id_text.is_empty() {
+                None
+            } else {
+                Some(game_id_text)
+            };
+            let store = if store_text.is_empty() {
+                None
+            } else {
+                Some(store_text)
+            };
+            sender_clone.input(MainWindowMsg::SaveGameSettings {
+                capsule_dir: capsule_dir_clone.clone(),
+                exe_path,
+                game_id,
+                store,
+                install_vcredist,
+                install_dxweb,
+                protonfixes_disable,
+                protonfixes_tricks,
+                protonfixes_replace_cmds,
+                protonfixes_dxvk_sets,
+            });
+            sender_clone.input(MainWindowMsg::DependenciesSelected {
+                capsule_dir: capsule_dir_clone.clone(),
+                install_vcredist,
+                install_dxweb,
+                force: true,
+            });
+            sender_clone.input(MainWindowMsg::SettingsDialogClosed);
+            dialog_clone.close();
         });
 
         dialog.show();
+        self.settings_dialog = Some(dialog);
     }
 
     fn start_installer(
@@ -250,42 +1071,109 @@ impl MainWindow {
             return;
         }
 
-        let mut cmd = Command::new("umu-run");
-        cmd.env("WINEPREFIX", &prefix_path);
-        cmd.env("PROTONPATH", &proton_path);
-        cmd.env("GAMEID", "umu-default");
-        cmd.env("STORE", "none");
-        cmd.arg(&installer_path);
+        self.preparing_installs.insert(capsule_dir.clone());
+        self.rebuild_games_list(sender.clone());
 
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setpgid(0, 0);
-                Ok(())
-            });
-        }
-
-        let mut child = match cmd.spawn() {
-            Ok(child) => child,
-            Err(e) => {
-                eprintln!("Failed to launch installer: {}", e);
-                return;
-            }
-        };
-
-        let pid = child.id() as i32;
-        let pgid = unsafe { libc::getpgid(pid) };
-        if pgid > 0 {
-            self.active_installs.insert(capsule_dir.clone(), pgid);
-        }
-
+        let env_metadata = metadata.clone();
         let sender_clone = sender.clone();
         thread::spawn(move || {
+            println!("Preloading UMU runtime...");
+            if !Self::run_umu_preflight(&prefix_path, &proton_path, &env_metadata) {
+                eprintln!("UMU runtime preload failed.");
+                let _ = sender_clone.input(MainWindowMsg::InstallerFinished {
+                    capsule_dir,
+                    success: false,
+                });
+                return;
+            }
+
+            let mut cmd = Self::umu_base_command(&prefix_path, &proton_path, &env_metadata);
+            cmd.arg(&installer_path);
+
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::setpgid(0, 0);
+                    Ok(())
+                });
+            }
+
+            let mut child = match cmd.spawn() {
+                Ok(child) => child,
+                Err(e) => {
+                    eprintln!("Failed to launch installer: {}", e);
+                    let _ = sender_clone.input(MainWindowMsg::InstallerFinished {
+                        capsule_dir,
+                        success: false,
+                    });
+                    return;
+                }
+            };
+
+            let pid = child.id() as i32;
+            let pgid = unsafe { libc::getpgid(pid) };
+            if pgid > 0 {
+                let _ = sender_clone.input(MainWindowMsg::InstallerStarted {
+                    capsule_dir: capsule_dir.clone(),
+                    pgid,
+                });
+            }
+
             let success = child.wait().map(|status| status.success()).unwrap_or(false);
             let _ = sender_clone.input(MainWindowMsg::InstallerFinished {
                 capsule_dir,
                 success,
             });
         });
+    }
+
+    fn umu_base_command(
+        prefix_path: &PathBuf,
+        proton_path: &PathBuf,
+        metadata: &CapsuleMetadata,
+    ) -> Command {
+        let mut cmd = Command::new("umu-run");
+        cmd.env("WINEPREFIX", prefix_path);
+        cmd.env("PROTONPATH", proton_path);
+        let game_id = metadata
+            .game_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("umu-default");
+        let store = metadata
+            .store
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("none");
+        cmd.env("GAMEID", game_id);
+        cmd.env("STORE", store);
+        if metadata.protonfixes_disable {
+            cmd.env("PROTONFIXES_DISABLE", "1");
+        }
+        for (key, value) in &metadata.env_vars {
+            let trimmed = key.trim();
+            if !trimmed.is_empty() {
+                cmd.env(trimmed, value);
+            }
+        }
+        cmd
+    }
+
+    fn run_umu_preflight(
+        prefix_path: &PathBuf,
+        proton_path: &PathBuf,
+        metadata: &CapsuleMetadata,
+    ) -> bool {
+        let mut cmd = Self::umu_base_command(prefix_path, proton_path, metadata);
+        cmd.arg("");
+        match cmd.status() {
+            Ok(status) => status.success(),
+            Err(e) => {
+                eprintln!("Failed to preload UMU runtime: {}", e);
+                false
+            }
+        }
     }
 
     fn rebuild_games_list(&mut self, sender: ComponentSender<Self>) {
@@ -366,9 +1254,15 @@ impl MainWindow {
 
             let installing = capsule.metadata.install_state == InstallState::Installing;
             let is_running = self.active_installs.contains_key(&capsule.capsule_dir);
+            let is_preparing = self.preparing_installs.contains(&capsule.capsule_dir);
+            let deps_running = self.dependency_installs.contains(&capsule.capsule_dir);
             let exe_missing = capsule.metadata.executables.main.path.trim().is_empty();
-            let detail_text = if installing {
-                if is_running {
+            let detail_text = if deps_running {
+                "Installing dependencies"
+            } else if installing {
+                if is_preparing {
+                    "Preparing runtime"
+                } else if is_running {
                     "Installer running"
                 } else {
                     "Installer paused"
@@ -414,7 +1308,7 @@ impl MainWindow {
                     kill_sender.input(MainWindowMsg::KillInstall(kill_dir.clone()));
                 });
                 actions.append(&kill_button);
-            } else if installing {
+            } else if installing && !is_preparing {
                 let resume_dir = capsule.capsule_dir.clone();
                 let resume_sender = sender.clone();
                 let resume_button = Button::with_label("Resume setup");
@@ -427,6 +1321,18 @@ impl MainWindow {
 
             card.append(&header);
             card.append(&detail);
+            if let Some(store) = capsule
+                .metadata
+                .store
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                let store_label = Label::new(Some(&format!("Store: {}", store)));
+                store_label.set_css_classes(&["muted"]);
+                store_label.set_halign(gtk4::Align::Start);
+                card.append(&store_label);
+            }
             card.append(&actions);
             list.append(&card);
         }
@@ -630,8 +1536,18 @@ impl SimpleComponent for MainWindow {
             runtime_mgr: RuntimeManager::new(),
             installer_dialog: None,
             name_dialog: None,
+            settings_dialog: None,
+            umu_match_dialog: None,
+            dependency_dialog: None,
             pending_installer_path: None,
+            pending_game_name: None,
+            pending_settings_capsule: None,
             active_installs: HashMap::new(),
+            preparing_installs: HashSet::new(),
+            dependency_installs: HashSet::new(),
+            umu_entries: Vec::new(),
+            umu_loaded: false,
+            umu_load_error: None,
             games_list: games_list.clone(),
             library_count_label,
             root_window: root.clone(),
@@ -643,6 +1559,7 @@ impl SimpleComponent for MainWindow {
 
         // Load capsules on startup
         sender.input(MainWindowMsg::LoadCapsules);
+        Self::start_umu_db_sync(sender.clone());
 
         ComponentParts { model, widgets }
     }
@@ -674,52 +1591,47 @@ impl SimpleComponent for MainWindow {
             MainWindowMsg::InstallerCancelled => {
                 self.installer_dialog = None;
                 self.name_dialog = None;
+                if let Some(dialog) = &self.umu_match_dialog {
+                    dialog.close();
+                }
+                self.umu_match_dialog = None;
                 self.pending_installer_path = None;
+                self.pending_game_name = None;
                 println!("Installer selection cancelled");
             }
             MainWindowMsg::GameNameConfirmed(name) => {
                 self.name_dialog = None;
-                let installer_path = match self.pending_installer_path.take() {
-                    Some(path) => path,
-                    None => {
-                        eprintln!("No installer path selected");
-                        return;
-                    }
-                };
-
                 let name = Self::sanitize_name(&name);
                 if name.is_empty() {
                     eprintln!("Game name cannot be empty");
                     return;
                 }
-
-                if let Err(e) = fs::create_dir_all(&self.games_dir) {
-                    eprintln!("Failed to create games directory: {}", e);
+                if self.pending_installer_path.is_none() {
+                    eprintln!("No installer path selected");
                     return;
                 }
 
-                let capsule_dir = self.unique_game_dir(&name);
-                if let Err(e) = fs::create_dir_all(&capsule_dir) {
-                    eprintln!("Failed to create capsule directory: {}", e);
-                    return;
+                self.pending_game_name = Some(name.clone());
+                let matches = self.find_umu_matches(&name);
+                if !matches.is_empty() {
+                    self.open_umu_match_dialog(sender, name, matches);
+                } else {
+                    self.finalize_pending_game(sender, None, None);
                 }
-
-                let mut metadata = CapsuleMetadata::default();
-                metadata.name = name.clone();
-                metadata.installer_path = Some(installer_path.to_string_lossy().to_string());
-                metadata.install_state = InstallState::Installing;
-
-                self.start_installer(&sender, capsule_dir, metadata, installer_path);
-                sender.input(MainWindowMsg::LoadCapsules);
             }
             MainWindowMsg::InstallerFinished { capsule_dir, success } => {
+                self.preparing_installs.remove(&capsule_dir);
                 self.active_installs.remove(&capsule_dir);
                 if success {
                     let mut needs_exe = false;
+                    let mut prompt_deps = false;
+                    let mut deps_metadata: Option<CapsuleMetadata> = None;
                     match Capsule::load_from_dir(&capsule_dir) {
                         Ok(mut capsule) => {
                             needs_exe = capsule.metadata.executables.main.path.trim().is_empty();
                             capsule.metadata.install_state = InstallState::Installed;
+                            prompt_deps = self.should_prompt_dependencies(&capsule.metadata);
+                            deps_metadata = Some(capsule.metadata.clone());
                             if let Err(e) = capsule.save_metadata() {
                                 eprintln!("Failed to update metadata: {}", e);
                             }
@@ -729,8 +1641,15 @@ impl SimpleComponent for MainWindow {
                         }
                     }
 
-                    if needs_exe {
-                        self.open_exe_dialog(sender.clone(), capsule_dir.clone());
+                    if prompt_deps {
+                        if needs_exe {
+                            self.pending_settings_capsule = Some(capsule_dir.clone());
+                        }
+                        if let Some(metadata) = deps_metadata {
+                            self.open_dependency_dialog(sender.clone(), capsule_dir.clone(), metadata);
+                        }
+                    } else if needs_exe {
+                        self.open_game_settings_dialog(sender.clone(), capsule_dir.clone());
                     }
                     println!("Installer completed for {:?}", capsule_dir);
                 } else {
@@ -738,19 +1657,119 @@ impl SimpleComponent for MainWindow {
                 }
                 sender.input(MainWindowMsg::LoadCapsules);
             }
-            MainWindowMsg::EditGame(capsule_dir) => {
-                self.open_exe_dialog(sender, capsule_dir);
+            MainWindowMsg::UmuDatabaseLoaded(entries) => {
+                self.umu_entries = entries;
+                self.umu_loaded = true;
+                self.umu_load_error = None;
+                println!("UMU database loaded ({} entries).", self.umu_entries.len());
             }
-            MainWindowMsg::SelectExecutable { capsule_dir, exe_path } => {
+            MainWindowMsg::UmuDatabaseFailed(error) => {
+                self.umu_loaded = true;
+                self.umu_load_error = Some(error.clone());
+                eprintln!("UMU database load failed: {}", error);
+            }
+            MainWindowMsg::UmuMatchChosen { game_id, store } => {
+                self.finalize_pending_game(sender, game_id, store);
+            }
+            MainWindowMsg::UmuMatchDialogClosed => {
+                self.umu_match_dialog = None;
+            }
+            MainWindowMsg::DependenciesSelected {
+                capsule_dir,
+                install_vcredist,
+                install_dxweb,
+                force,
+            } => {
                 match Capsule::load_from_dir(&capsule_dir) {
                     Ok(mut capsule) => {
-                        capsule.metadata.executables.main.path =
-                            exe_path.to_string_lossy().to_string();
-                        capsule.metadata.install_state = InstallState::Installed;
+                        capsule.metadata.install_vcredist = install_vcredist;
+                        capsule.metadata.install_dxweb = install_dxweb;
+                        if let Err(e) = capsule.save_metadata() {
+                            eprintln!("Failed to update metadata: {}", e);
+                        }
+                        self.start_dependency_install(
+                            sender.clone(),
+                            capsule_dir,
+                            capsule.metadata.clone(),
+                            install_vcredist,
+                            install_dxweb,
+                            force,
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to load capsule: {}", e);
+                    }
+                }
+            }
+            MainWindowMsg::DependenciesFinished { capsule_dir, installed } => {
+                self.dependency_installs.remove(&capsule_dir);
+                match Capsule::load_from_dir(&capsule_dir) {
+                    Ok(mut capsule) => {
+                        let mut updated = false;
+                        for dep in installed {
+                            if !capsule.metadata.redistributables_installed.contains(&dep) {
+                                capsule.metadata.redistributables_installed.push(dep);
+                                updated = true;
+                            }
+                        }
+                        if updated {
+                            if let Err(e) = capsule.save_metadata() {
+                                eprintln!("Failed to update metadata: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to load capsule: {}", e);
+                    }
+                }
+                self.rebuild_games_list(sender.clone());
+            }
+            MainWindowMsg::DependenciesDialogClosed => {
+                self.dependency_dialog = None;
+                if let Some(capsule_dir) = self.pending_settings_capsule.take() {
+                    self.open_game_settings_dialog(sender, capsule_dir);
+                }
+            }
+            MainWindowMsg::InstallerStarted { capsule_dir, pgid } => {
+                self.preparing_installs.remove(&capsule_dir);
+                self.active_installs.insert(capsule_dir, pgid);
+                self.rebuild_games_list(sender.clone());
+            }
+            MainWindowMsg::EditGame(capsule_dir) => {
+                self.open_game_settings_dialog(sender, capsule_dir);
+            }
+            MainWindowMsg::SaveGameSettings {
+                capsule_dir,
+                exe_path,
+                game_id,
+                store,
+                install_vcredist,
+                install_dxweb,
+                protonfixes_disable,
+                protonfixes_tricks,
+                protonfixes_replace_cmds,
+                protonfixes_dxvk_sets,
+            } => {
+                match Capsule::load_from_dir(&capsule_dir) {
+                    Ok(mut capsule) => {
+                        if !exe_path.trim().is_empty() {
+                            capsule.metadata.executables.main.path = exe_path;
+                            capsule.metadata.install_state = InstallState::Installed;
+                        } else {
+                            capsule.metadata.executables.main.path = exe_path;
+                        }
+                        capsule.metadata.game_id = game_id;
+                        capsule.metadata.store = store;
+                        capsule.metadata.install_vcredist = install_vcredist;
+                        capsule.metadata.install_dxweb = install_dxweb;
+                        capsule.metadata.protonfixes_disable = protonfixes_disable;
+                        capsule.metadata.protonfixes_tricks = protonfixes_tricks;
+                        capsule.metadata.protonfixes_replace_cmds = protonfixes_replace_cmds;
+                        capsule.metadata.protonfixes_dxvk_sets = protonfixes_dxvk_sets;
                         if let Err(e) = capsule.save_metadata() {
                             eprintln!("Failed to update metadata: {}", e);
                         } else {
-                            println!("Updated executable for {}", capsule.name);
+                            println!("Updated settings for {}", capsule.name);
                             sender.input(MainWindowMsg::LoadCapsules);
                         }
                     }
@@ -758,6 +1777,9 @@ impl SimpleComponent for MainWindow {
                         eprintln!("Failed to load capsule: {}", e);
                     }
                 }
+            }
+            MainWindowMsg::SettingsDialogClosed => {
+                self.settings_dialog = None;
             }
             MainWindowMsg::DeleteGame(capsule_dir) => {
                 if let Err(e) = fs::remove_dir_all(&capsule_dir) {

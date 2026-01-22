@@ -137,6 +137,66 @@ apt_install "$UMU_DEB"
 
 rm -rf "$TMP_DIR"
 
+CACHE_DIR="$HOME/.linuxboy/cache/deps"
+mkdir -p "$CACHE_DIR"
+
+download_if_missing() {
+  url="$1"
+  dest="$2"
+  insecure="${3:-0}"
+
+  if [ "$REINSTALL" -eq 1 ] || [ ! -f "$dest" ]; then
+    if [ "$insecure" -eq 1 ]; then
+      if ! curl -L -k -o "$dest" "$url"; then
+        echo "Failed to download: $url"
+        rm -f "$dest"
+        return 1
+      fi
+    else
+      if ! curl -L -o "$dest" "$url"; then
+        echo "Failed to download: $url"
+        rm -f "$dest"
+        return 1
+      fi
+    fi
+  fi
+  return 0
+}
+
+VCREDIST_API="https://api.github.com/repos/abbodi1406/vcredist/releases/latest"
+VCREDIST_URL="$(
+  curl -sL "$VCREDIST_API" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assets = data.get("assets", [])
+preferred = ["VisualCppRedist_AIO_x86_x64.exe", "VisualCppRedist_AIO_x86only.exe"]
+for name in preferred:
+    for asset in assets:
+        if asset.get("name") == name:
+            print(asset.get("browser_download_url", ""))
+            sys.exit(0)
+sys.exit(1)
+'
+  || true
+)"
+
+VCREDIST_DEST="${CACHE_DIR}/vcredist_aio.exe"
+if [ -n "$VCREDIST_URL" ]; then
+  echo "Downloading VC++ AIO (abbodi1406)..."
+  if ! download_if_missing "$VCREDIST_URL" "$VCREDIST_DEST" 0; then
+    echo "VC++ AIO download failed (optional)."
+  fi
+else
+  echo "VC++ AIO release asset not found (optional)."
+fi
+
+DXWEB_URL="https://download.microsoft.com/download/1/7/1/1718ccc4-6315-4d8e-9543-8e28a4e18c4c/dxwebsetup.exe"
+DXWEB_DEST="${CACHE_DIR}/dxwebsetup.exe"
+echo "Downloading DirectX web installer..."
+if ! download_if_missing "$DXWEB_URL" "$DXWEB_DEST" 1; then
+  echo "DirectX web installer download failed (optional)."
+fi
+
 if [ -f "./Cargo.toml" ]; then
   if ! command -v cargo >/dev/null 2>&1; then
     echo "cargo not found, installing..."

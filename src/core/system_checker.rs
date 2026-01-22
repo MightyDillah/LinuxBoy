@@ -15,6 +15,8 @@ pub struct SystemCheck {
     pub mesa_installed: bool,
     pub proton_installed: bool,
     pub umu_installed: bool,
+    pub vcredist_cached: bool,
+    pub dxweb_cached: bool,
     pub missing_apt_packages: Vec<String>,
 }
 
@@ -25,6 +27,8 @@ impl SystemCheck {
         let mesa_installed = Self::check_mesa();
         let proton_installed = Self::check_proton_ge();
         let umu_installed = Self::check_command("umu-run");
+        let vcredist_cached = Self::vcredist_cache_path().is_file();
+        let dxweb_cached = Self::dxweb_cache_path().is_file();
 
         let mut missing_apt_packages = Vec::new();
         
@@ -66,6 +70,14 @@ impl SystemCheck {
             "  UMU Launcher: {}",
             if umu_installed { "installed" } else { "missing" }
         );
+        println!(
+            "  VCRedist cache: {}",
+            if vcredist_cached { "downloaded" } else { "missing" }
+        );
+        println!(
+            "  DirectX web setup cache: {}",
+            if dxweb_cached { "downloaded" } else { "missing" }
+        );
         if missing_apt_packages.is_empty() {
             println!("  Missing apt packages: none");
         } else {
@@ -79,6 +91,8 @@ impl SystemCheck {
             mesa_installed,
             proton_installed,
             umu_installed,
+            vcredist_cached,
+            dxweb_cached,
             missing_apt_packages,
         }
     }
@@ -93,6 +107,24 @@ impl SystemCheck {
     /// Get runtimes directory
     pub fn get_runtimes_dir() -> PathBuf {
         Self::get_linuxboy_dir().join("runtimes")
+    }
+
+    /// Get cache directory
+    pub fn get_cache_dir() -> PathBuf {
+        Self::get_linuxboy_dir().join("cache")
+    }
+
+    /// Get dependency cache directory
+    pub fn get_deps_dir() -> PathBuf {
+        Self::get_cache_dir().join("deps")
+    }
+
+    pub fn vcredist_cache_path() -> PathBuf {
+        Self::get_deps_dir().join("vcredist_aio.exe")
+    }
+
+    pub fn dxweb_cache_path() -> PathBuf {
+        Self::get_deps_dir().join("dxwebsetup.exe")
     }
 
     /// Check if a command exists in PATH
