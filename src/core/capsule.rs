@@ -33,6 +33,8 @@ pub struct CapsuleMetadata {
     #[serde(default)]
     pub store: Option<String>,
     #[serde(default)]
+    pub game_dir: Option<String>,
+    #[serde(default)]
     pub protonfixes_disable: bool,
     #[serde(default)]
     pub protonfixes_tricks: Vec<String>,
@@ -142,6 +144,7 @@ impl Default for CapsuleMetadata {
             },
             game_id: None,
             store: None,
+            game_dir: None,
             protonfixes_disable: false,
             protonfixes_tricks: Vec::new(),
             protonfixes_replace_cmds: Vec::new(),

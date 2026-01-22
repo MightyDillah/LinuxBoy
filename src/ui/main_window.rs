@@ -14,17 +14,22 @@ use crate::core::umu_database::{UmuDatabase, UmuEntry};
 use crate::ui::system_setup_dialog::{SystemSetupDialog, SystemSetupMsg, SystemSetupOutput};
 use std::collections::{HashMap, HashSet};
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::{fs, thread};
+use std::{fs, io, thread};
 
 #[derive(Debug)]
 pub enum MainWindowMsg {
     LoadCapsules,
-    OpenInstaller,
+    OpenAddGame,
+    AddGameModeChosen(AddGameMode),
     OpenSystemSetup,
-    InstallerSelected(PathBuf),
-    InstallerCancelled,
+    GamePathSelected(PathBuf),
+    AddGameCancelled,
+    ExistingSourceFolderSelected(PathBuf),
+    ExistingSourceFolderCancelled,
+    ExistingGameLocationConfirmed(String),
+    ExistingGameLocationCancelled,
     GameNameConfirmed(String),
     InstallerStarted {
         capsule_dir: PathBuf,
@@ -65,6 +70,15 @@ pub enum MainWindowMsg {
         installed: Vec<String>,
     },
     DependenciesDialogClosed,
+    GameStarted {
+        capsule_dir: PathBuf,
+        pgid: i32,
+    },
+    GameFinished {
+        capsule_dir: PathBuf,
+        success: bool,
+    },
+    LaunchGame(PathBuf),
     EditGame(PathBuf),
     DeleteGame(PathBuf),
     ResumeInstall(PathBuf),
@@ -78,15 +92,22 @@ pub struct MainWindow {
     system_check: SystemCheck,
     system_setup_dialog: Option<Controller<SystemSetupDialog>>,
     runtime_mgr: RuntimeManager,
-    installer_dialog: Option<FileChooserNative>,
+    add_game_dialog: Option<Dialog>,
+    game_path_dialog: Option<FileChooserNative>,
     name_dialog: Option<Dialog>,
     settings_dialog: Option<Dialog>,
     umu_match_dialog: Option<Dialog>,
     dependency_dialog: Option<Dialog>,
-    pending_installer_path: Option<PathBuf>,
+    existing_location_dialog: Option<Dialog>,
+    pending_add_mode: Option<AddGameMode>,
+    pending_game_path: Option<PathBuf>,
+    pending_source_folder: Option<PathBuf>,
     pending_game_name: Option<String>,
+    pending_game_id: Option<String>,
+    pending_store: Option<String>,
     pending_settings_capsule: Option<PathBuf>,
     active_installs: HashMap<PathBuf, i32>,
+    active_games: HashMap<PathBuf, i32>,
     preparing_installs: HashSet<PathBuf>,
     dependency_installs: HashSet<PathBuf>,
     umu_entries: Vec<UmuEntry>,
@@ -95,6 +116,12 @@ pub struct MainWindow {
     games_list: Box,
     library_count_label: Label,
     root_window: ApplicationWindow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AddGameMode {
+    Installer,
+    Existing,
 }
 
 #[derive(Debug, Clone)]
@@ -211,6 +238,55 @@ impl MainWindow {
         vcredist_pending || dxweb_pending
     }
 
+    fn resolve_relative_game_folder(name: &str, input: &str) -> String {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return name.to_string();
+        }
+        let path = Path::new(trimmed);
+        if path.is_absolute() {
+            eprintln!("Game folder must be relative to prefix/games. Using default.");
+            return name.to_string();
+        }
+        trimmed.to_string()
+    }
+
+    fn unique_path(path: PathBuf) -> PathBuf {
+        if !path.exists() {
+            return path;
+        }
+        let parent = path.parent().unwrap_or_else(|| Path::new(""));
+        let stem = path
+            .file_name()
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_else(|| "game".to_string());
+        for idx in 1..1000 {
+            let candidate = parent.join(format!("{}-{}", stem, idx));
+            if !candidate.exists() {
+                return candidate;
+            }
+        }
+        path
+    }
+
+    fn copy_dir_recursive(src: &Path, dest: &Path) -> io::Result<()> {
+        if !dest.exists() {
+            fs::create_dir_all(dest)?;
+        }
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            let from = entry.path();
+            let to = dest.join(entry.file_name());
+            if file_type.is_dir() {
+                Self::copy_dir_recursive(&from, &to)?;
+            } else {
+                fs::copy(&from, &to)?;
+            }
+        }
+        Ok(())
+    }
+
     fn update_library_labels(&self) {
         self.library_count_label
             .set_label(&format!("{} games", self.capsules.len()));
@@ -248,14 +324,71 @@ impl MainWindow {
             .unwrap_or(false)
     }
 
-    fn open_installer_dialog(&mut self, sender: ComponentSender<Self>) {
-        if let Some(dialog) = &self.installer_dialog {
+    fn open_add_game_dialog(&mut self, sender: ComponentSender<Self>) {
+        if self.add_game_dialog.is_some() {
+            return;
+        }
+
+        let dialog = Dialog::builder()
+            .title("Add Game")
+            .modal(true)
+            .transient_for(&self.root_window)
+            .build();
+        dialog.add_button("Cancel", ResponseType::Cancel);
+        dialog.add_button("Install from installer", ResponseType::Accept);
+        dialog.add_button("Add existing game", ResponseType::Apply);
+
+        let content = dialog.content_area();
+        let layout = Box::new(Orientation::Vertical, 8);
+        layout.set_margin_all(12);
+
+        let title = Label::new(Some("Choose how to add this game"));
+        title.set_halign(gtk4::Align::Start);
+        title.set_css_classes(&["section-title"]);
+
+        let hint = Label::new(Some(
+            "Installers run through UMU. Existing games will be copied into the prefix.",
+        ));
+        hint.set_halign(gtk4::Align::Start);
+        hint.set_wrap(true);
+        hint.set_css_classes(&["muted"]);
+
+        layout.append(&title);
+        layout.append(&hint);
+        content.append(&layout);
+
+        let sender_clone = sender.clone();
+        dialog.connect_response(move |dialog, response| {
+            match response {
+                ResponseType::Accept => {
+                    sender_clone.input(MainWindowMsg::AddGameModeChosen(AddGameMode::Installer));
+                }
+                ResponseType::Apply => {
+                    sender_clone.input(MainWindowMsg::AddGameModeChosen(AddGameMode::Existing));
+                }
+                _ => {
+                    sender_clone.input(MainWindowMsg::AddGameCancelled);
+                }
+            }
+            dialog.close();
+        });
+
+        dialog.show();
+        self.add_game_dialog = Some(dialog);
+    }
+
+    fn open_game_path_dialog(&mut self, sender: ComponentSender<Self>, mode: AddGameMode) {
+        if let Some(dialog) = &self.game_path_dialog {
             dialog.show();
             return;
         }
 
+        let title = match mode {
+            AddGameMode::Installer => "Select Installer",
+            AddGameMode::Existing => "Select Game Executable",
+        };
         let dialog = FileChooserNative::builder()
-            .title("Select Installer")
+            .title(title)
             .action(FileChooserAction::Open)
             .accept_label("Select")
             .cancel_label("Cancel")
@@ -264,8 +397,12 @@ impl MainWindow {
 
         let filter = FileFilter::new();
         filter.add_suffix("exe");
-        filter.add_suffix("msi");
-        filter.set_name(Some("Windows installers (.exe, .msi)"));
+        if mode == AddGameMode::Installer {
+            filter.add_suffix("msi");
+            filter.set_name(Some("Windows installers (.exe, .msi)"));
+        } else {
+            filter.set_name(Some("Windows executables (.exe)"));
+        }
         dialog.add_filter(&filter);
 
         let sender_clone = sender.clone();
@@ -273,22 +410,22 @@ impl MainWindow {
             if response == ResponseType::Accept {
                 if let Some(file) = dialog.file() {
                     if let Some(path) = file.path() {
-                        sender_clone.input(MainWindowMsg::InstallerSelected(path));
+                        sender_clone.input(MainWindowMsg::GamePathSelected(path));
                     } else {
-                        sender_clone.input(MainWindowMsg::InstallerCancelled);
+                        sender_clone.input(MainWindowMsg::AddGameCancelled);
                     }
                 } else {
-                    sender_clone.input(MainWindowMsg::InstallerCancelled);
+                    sender_clone.input(MainWindowMsg::AddGameCancelled);
                 }
             } else {
-                sender_clone.input(MainWindowMsg::InstallerCancelled);
+                sender_clone.input(MainWindowMsg::AddGameCancelled);
             }
 
             dialog.destroy();
         });
 
         dialog.show();
-        self.installer_dialog = Some(dialog);
+        self.game_path_dialog = Some(dialog);
     }
 
     fn open_name_dialog(&mut self, sender: ComponentSender<Self>) {
@@ -315,7 +452,7 @@ impl MainWindow {
                 let name = entry.text().to_string();
                 sender_clone.input(MainWindowMsg::GameNameConfirmed(name));
             } else {
-                sender_clone.input(MainWindowMsg::InstallerCancelled);
+                sender_clone.input(MainWindowMsg::AddGameCancelled);
             }
 
             dialog.close();
@@ -323,6 +460,101 @@ impl MainWindow {
 
         dialog.show();
         self.name_dialog = Some(dialog);
+    }
+
+    fn open_existing_game_location_dialog(
+        &mut self,
+        sender: ComponentSender<Self>,
+        game_name: String,
+    ) {
+        if self.existing_location_dialog.is_some() {
+            return;
+        }
+
+        let dialog = Dialog::builder()
+            .title("Game Folder")
+            .modal(true)
+            .transient_for(&self.root_window)
+            .build();
+        dialog.add_button("Cancel", ResponseType::Cancel);
+        dialog.add_button("Continue", ResponseType::Accept);
+
+        let content = dialog.content_area();
+        let layout = Box::new(Orientation::Vertical, 8);
+        layout.set_margin_all(12);
+
+        let title = Label::new(Some("Choose where to copy the game files"));
+        title.set_halign(gtk4::Align::Start);
+        title.set_css_classes(&["section-title"]);
+
+        let hint = Label::new(Some(
+            "Path is relative to the prefix 'games' folder.",
+        ));
+        hint.set_halign(gtk4::Align::Start);
+        hint.set_wrap(true);
+        hint.set_css_classes(&["muted"]);
+
+        let location_label = Label::new(Some("Game folder (inside prefix/games)"));
+        location_label.set_halign(gtk4::Align::Start);
+        let location_entry = Entry::new();
+        location_entry.set_placeholder_text(Some("e.g., MyGame"));
+        location_entry.set_text(&game_name);
+
+        layout.append(&title);
+        layout.append(&hint);
+        layout.append(&location_label);
+        layout.append(&location_entry);
+        content.append(&layout);
+
+        let sender_clone = sender.clone();
+        dialog.connect_response(move |dialog, response| {
+            if response == ResponseType::Accept {
+                sender_clone.input(MainWindowMsg::ExistingGameLocationConfirmed(
+                    location_entry.text().to_string(),
+                ));
+            } else {
+                sender_clone.input(MainWindowMsg::ExistingGameLocationCancelled);
+            }
+            dialog.close();
+        });
+
+        dialog.show();
+        self.existing_location_dialog = Some(dialog);
+    }
+
+    fn open_existing_source_folder_dialog(&mut self, sender: ComponentSender<Self>) {
+        if self.game_path_dialog.is_some() {
+            return;
+        }
+
+        let dialog = FileChooserNative::builder()
+            .title("Select Game Folder to Copy")
+            .action(FileChooserAction::SelectFolder)
+            .accept_label("Select")
+            .cancel_label("Cancel")
+            .transient_for(&self.root_window)
+            .build();
+
+        let sender_clone = sender.clone();
+        dialog.connect_response(move |dialog, response| {
+            if response == ResponseType::Accept {
+                if let Some(file) = dialog.file() {
+                    if let Some(path) = file.path() {
+                        sender_clone.input(MainWindowMsg::ExistingSourceFolderSelected(path));
+                    } else {
+                        sender_clone.input(MainWindowMsg::ExistingSourceFolderCancelled);
+                    }
+                } else {
+                    sender_clone.input(MainWindowMsg::ExistingSourceFolderCancelled);
+                }
+            } else {
+                sender_clone.input(MainWindowMsg::ExistingSourceFolderCancelled);
+            }
+            dialog.destroy();
+        });
+
+        dialog.show();
+        self.game_path_dialog = Some(dialog);
     }
 
     fn start_umu_db_sync(sender: ComponentSender<Self>) {
@@ -642,13 +874,110 @@ impl MainWindow {
         });
     }
 
+    fn start_game(
+        &mut self,
+        sender: ComponentSender<Self>,
+        capsule_dir: PathBuf,
+    ) {
+        let capsule = match Capsule::load_from_dir(&capsule_dir) {
+            Ok(capsule) => capsule,
+            Err(e) => {
+                eprintln!("Failed to load capsule: {}", e);
+                return;
+            }
+        };
+
+        if capsule.metadata.executables.main.path.trim().is_empty() {
+            eprintln!("No executable configured for {}", capsule.name);
+            return;
+        }
+
+        if !Self::has_command("umu-run") {
+            eprintln!("umu-run not found in PATH");
+            return;
+        }
+
+        let proton_path = match self.runtime_mgr.latest_installed() {
+            Ok(Some(path)) => path,
+            Ok(None) => {
+                eprintln!("No Proton-GE runtime installed");
+                return;
+            }
+            Err(e) => {
+                eprintln!("Failed to resolve Proton-GE runtime: {}", e);
+                return;
+            }
+        };
+
+        let home_path = capsule.capsule_dir.join(format!("{}.AppImage.home", capsule.name));
+        let prefix_path = home_path.join("prefix");
+
+        let mut cmd = Self::umu_base_command(&prefix_path, &proton_path, &capsule.metadata);
+        cmd.arg(&capsule.metadata.executables.main.path);
+
+        let args = capsule.metadata.executables.main.args.trim();
+        if !args.is_empty() {
+            cmd.args(args.split_whitespace());
+        }
+
+        for trick in &capsule.metadata.protonfixes_tricks {
+            cmd.arg(format!("-pf_tricks={}", trick));
+        }
+        for replace in &capsule.metadata.protonfixes_replace_cmds {
+            cmd.arg(format!("-pf_replace_cmd={}", replace));
+        }
+        for option in &capsule.metadata.protonfixes_dxvk_sets {
+            cmd.arg(format!("-pf_dxvk_set={}", option));
+        }
+
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setpgid(0, 0);
+                Ok(())
+            });
+        }
+
+        let sender_clone = sender.clone();
+        thread::spawn(move || {
+            let mut child = match cmd.spawn() {
+                Ok(child) => child,
+                Err(e) => {
+                    eprintln!("Failed to launch game: {}", e);
+                    let _ = sender_clone.input(MainWindowMsg::GameFinished {
+                        capsule_dir,
+                        success: false,
+                    });
+                    return;
+                }
+            };
+
+            let pid = child.id() as i32;
+            let pgid = unsafe { libc::getpgid(pid) };
+            if pgid > 0 {
+                let _ = sender_clone.input(MainWindowMsg::GameStarted {
+                    capsule_dir: capsule_dir.clone(),
+                    pgid,
+                });
+            }
+
+            let success = child.wait().map(|status| status.success()).unwrap_or(false);
+            let _ = sender_clone.input(MainWindowMsg::GameFinished {
+                capsule_dir,
+                success,
+            });
+        });
+    }
+
     fn finalize_pending_game(
         &mut self,
         sender: ComponentSender<Self>,
         game_id: Option<String>,
         store: Option<String>,
     ) {
-        let installer_path = match self.pending_installer_path.take() {
+        self.pending_add_mode = None;
+        self.pending_game_id = None;
+        self.pending_store = None;
+        let installer_path = match self.pending_game_path.take() {
             Some(path) => path,
             None => {
                 eprintln!("No installer path selected");
@@ -682,8 +1011,135 @@ impl MainWindow {
         metadata.install_state = InstallState::Installing;
         metadata.game_id = game_id;
         metadata.store = store;
+        let home_path = capsule_dir.join(format!("{}.AppImage.home", name));
+        let prefix_path = home_path.join("prefix");
+        let default_game_dir = prefix_path.join("games").join(&metadata.name);
+        metadata.game_dir = Some(default_game_dir.to_string_lossy().to_string());
 
         self.start_installer(&sender, capsule_dir, metadata, installer_path);
+        sender.input(MainWindowMsg::LoadCapsules);
+    }
+
+    fn finalize_existing_game(
+        &mut self,
+        sender: ComponentSender<Self>,
+        target_input: String,
+    ) {
+        self.pending_add_mode = None;
+        let exe_path = match self.pending_game_path.take() {
+            Some(path) => path,
+            None => {
+                eprintln!("No game executable selected");
+                self.pending_game_name = None;
+                self.pending_game_id = None;
+                self.pending_store = None;
+                return;
+            }
+        };
+
+        let name = match self.pending_game_name.take() {
+            Some(name) => name,
+            None => {
+                eprintln!("No pending game name available");
+                self.pending_game_id = None;
+                self.pending_store = None;
+                return;
+            }
+        };
+
+        let source_dir = match self.pending_source_folder.take() {
+            Some(path) => path,
+            None => {
+                eprintln!("No source folder selected");
+                self.pending_game_id = None;
+                self.pending_store = None;
+                return;
+            }
+        };
+
+        let game_id = self.pending_game_id.take();
+        let store = self.pending_store.take();
+
+        if let Err(e) = fs::create_dir_all(&self.games_dir) {
+            eprintln!("Failed to create games directory: {}", e);
+            return;
+        }
+
+        let capsule_dir = self.unique_game_dir(&name);
+        if let Err(e) = fs::create_dir_all(&capsule_dir) {
+            eprintln!("Failed to create capsule directory: {}", e);
+            return;
+        }
+
+        let home_path = capsule_dir.join(format!("{}.AppImage.home", name));
+        let prefix_path = home_path.join("prefix");
+        let games_root = prefix_path.join("games");
+        if let Err(e) = fs::create_dir_all(prefix_path.join("drive_c")) {
+            eprintln!("Failed to create prefix: {}", e);
+            return;
+        }
+        if let Err(e) = fs::create_dir_all(&games_root) {
+            eprintln!("Failed to create games folder: {}", e);
+            return;
+        }
+
+        let relative_folder = Self::resolve_relative_game_folder(&name, &target_input);
+        let mut dest_dir = games_root.join(relative_folder);
+        dest_dir = Self::unique_path(dest_dir);
+
+        let mut should_copy = true;
+        if let (Ok(src), Ok(dest)) = (fs::canonicalize(&source_dir), fs::canonicalize(&dest_dir)) {
+            if src == dest {
+                should_copy = false;
+            }
+        }
+
+        if exe_path.strip_prefix(&source_dir).is_err() {
+            eprintln!("Selected executable is not inside the chosen folder.");
+            return;
+        }
+
+        if should_copy {
+            if let Err(e) = Self::copy_dir_recursive(&source_dir, &dest_dir) {
+                eprintln!("Failed to copy game files: {}", e);
+                return;
+            }
+        }
+
+        let relative_exe = exe_path
+            .strip_prefix(&source_dir)
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                exe_path
+                    .file_name()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(PathBuf::new)
+            });
+        let new_exe_path = dest_dir.join(relative_exe);
+
+        let mut metadata = CapsuleMetadata::default();
+        metadata.name = name.clone();
+        metadata.install_state = InstallState::Installed;
+        metadata.executables.main.path = new_exe_path.to_string_lossy().to_string();
+        metadata.game_id = game_id;
+        metadata.store = store;
+        metadata.game_dir = Some(dest_dir.to_string_lossy().to_string());
+
+        let capsule = Capsule {
+            name: metadata.name.clone(),
+            capsule_dir: capsule_dir.clone(),
+            home_path,
+            metadata: metadata.clone(),
+        };
+
+        if let Err(e) = capsule.save_metadata() {
+            eprintln!("Failed to save metadata: {}", e);
+            return;
+        }
+
+        if self.should_prompt_dependencies(&metadata) {
+            self.open_dependency_dialog(sender.clone(), capsule_dir.clone(), metadata);
+        }
         sender.input(MainWindowMsg::LoadCapsules);
     }
 
@@ -1055,6 +1511,17 @@ impl MainWindow {
             eprintln!("Failed to create prefix: {}", e);
             return;
         }
+        if let Err(e) = fs::create_dir_all(prefix_path.join("games")) {
+            eprintln!("Failed to create games folder: {}", e);
+            return;
+        }
+        if let Some(game_dir) = metadata.game_dir.as_deref() {
+            let path = PathBuf::from(game_dir);
+            if let Err(e) = fs::create_dir_all(&path) {
+                eprintln!("Failed to create default game folder: {}", e);
+                return;
+            }
+        }
 
         metadata.installer_path = Some(installer_path.to_string_lossy().to_string());
         metadata.install_state = InstallState::Installing;
@@ -1256,9 +1723,12 @@ impl MainWindow {
             let is_running = self.active_installs.contains_key(&capsule.capsule_dir);
             let is_preparing = self.preparing_installs.contains(&capsule.capsule_dir);
             let deps_running = self.dependency_installs.contains(&capsule.capsule_dir);
+            let game_running = self.active_games.contains_key(&capsule.capsule_dir);
             let exe_missing = capsule.metadata.executables.main.path.trim().is_empty();
             let detail_text = if deps_running {
                 "Installing dependencies"
+            } else if game_running {
+                "Game running"
             } else if installing {
                 if is_preparing {
                     "Preparing runtime"
@@ -1317,6 +1787,18 @@ impl MainWindow {
                     resume_sender.input(MainWindowMsg::ResumeInstall(resume_dir.clone()));
                 });
                 actions.append(&resume_button);
+            }
+
+            if !installing && !exe_missing {
+                let play_dir = capsule.capsule_dir.clone();
+                let play_sender = sender.clone();
+                let play_button = Button::with_label(if game_running { "Running" } else { "Play" });
+                play_button.add_css_class("suggested-action");
+                play_button.set_sensitive(!game_running);
+                play_button.connect_clicked(move |_| {
+                    play_sender.input(MainWindowMsg::LaunchGame(play_dir.clone()));
+                });
+                actions.append(&play_button);
             }
 
             card.append(&header);
@@ -1406,7 +1888,7 @@ impl SimpleComponent for MainWindow {
                                 set_label: "Add Game",
                             },
                         },
-                        connect_clicked => MainWindowMsg::OpenInstaller,
+                        connect_clicked => MainWindowMsg::OpenAddGame,
                     },
                 },
 
@@ -1534,15 +2016,22 @@ impl SimpleComponent for MainWindow {
             system_check,
             system_setup_dialog: None,
             runtime_mgr: RuntimeManager::new(),
-            installer_dialog: None,
+            add_game_dialog: None,
+            game_path_dialog: None,
             name_dialog: None,
             settings_dialog: None,
             umu_match_dialog: None,
             dependency_dialog: None,
-            pending_installer_path: None,
+            existing_location_dialog: None,
+            pending_add_mode: None,
+            pending_game_path: None,
+            pending_source_folder: None,
             pending_game_name: None,
+            pending_game_id: None,
+            pending_store: None,
             pending_settings_capsule: None,
             active_installs: HashMap::new(),
+            active_games: HashMap::new(),
             preparing_installs: HashSet::new(),
             dependency_installs: HashSet::new(),
             umu_entries: Vec::new(),
@@ -1579,25 +2068,71 @@ impl SimpleComponent for MainWindow {
                     }
                 }
             }
-            MainWindowMsg::OpenInstaller => {
-                println!("Open installer dialog");
-                self.open_installer_dialog(sender);
+            MainWindowMsg::OpenAddGame => {
+                println!("Open add game dialog");
+                self.open_add_game_dialog(sender);
             }
-            MainWindowMsg::InstallerSelected(path) => {
-                self.installer_dialog = None;
-                self.pending_installer_path = Some(path);
+            MainWindowMsg::AddGameModeChosen(mode) => {
+                self.add_game_dialog = None;
+                self.pending_add_mode = Some(mode);
+                self.open_game_path_dialog(sender, mode);
+            }
+            MainWindowMsg::GamePathSelected(path) => {
+                self.game_path_dialog = None;
+                self.pending_game_path = Some(path);
                 self.open_name_dialog(sender);
             }
-            MainWindowMsg::InstallerCancelled => {
-                self.installer_dialog = None;
+            MainWindowMsg::AddGameCancelled => {
+                self.add_game_dialog = None;
+                self.game_path_dialog = None;
                 self.name_dialog = None;
                 if let Some(dialog) = &self.umu_match_dialog {
                     dialog.close();
                 }
+                if let Some(dialog) = &self.existing_location_dialog {
+                    dialog.close();
+                }
                 self.umu_match_dialog = None;
-                self.pending_installer_path = None;
+                self.existing_location_dialog = None;
+                self.pending_add_mode = None;
+                self.pending_game_path = None;
+                self.pending_source_folder = None;
                 self.pending_game_name = None;
-                println!("Installer selection cancelled");
+                self.pending_game_id = None;
+                self.pending_store = None;
+                println!("Add game cancelled");
+            }
+            MainWindowMsg::ExistingSourceFolderSelected(path) => {
+                self.game_path_dialog = None;
+                self.pending_source_folder = Some(path);
+                let game_name = match self.pending_game_name.clone() {
+                    Some(name) => name,
+                    None => {
+                        eprintln!("No pending game name available");
+                        return;
+                    }
+                };
+                self.open_existing_game_location_dialog(sender, game_name);
+            }
+            MainWindowMsg::ExistingSourceFolderCancelled => {
+                self.game_path_dialog = None;
+                self.pending_source_folder = None;
+                self.pending_game_id = None;
+                self.pending_store = None;
+                self.pending_game_name = None;
+                self.pending_game_path = None;
+            }
+            MainWindowMsg::ExistingGameLocationConfirmed(folder) => {
+                self.existing_location_dialog = None;
+                self.finalize_existing_game(sender, folder);
+            }
+            MainWindowMsg::ExistingGameLocationCancelled => {
+                self.existing_location_dialog = None;
+                self.pending_source_folder = None;
+                self.pending_game_id = None;
+                self.pending_store = None;
+                self.pending_game_name = None;
+                self.pending_game_path = None;
             }
             MainWindowMsg::GameNameConfirmed(name) => {
                 self.name_dialog = None;
@@ -1606,17 +2141,33 @@ impl SimpleComponent for MainWindow {
                     eprintln!("Game name cannot be empty");
                     return;
                 }
-                if self.pending_installer_path.is_none() {
-                    eprintln!("No installer path selected");
+                if self.pending_game_path.is_none() {
+                    eprintln!("No game path selected");
                     return;
                 }
+                let add_mode = match self.pending_add_mode {
+                    Some(mode) => mode,
+                    None => {
+                        eprintln!("Add game mode not set");
+                        return;
+                    }
+                };
 
                 self.pending_game_name = Some(name.clone());
                 let matches = self.find_umu_matches(&name);
                 if !matches.is_empty() {
                     self.open_umu_match_dialog(sender, name, matches);
                 } else {
-                    self.finalize_pending_game(sender, None, None);
+                    match add_mode {
+                        AddGameMode::Installer => {
+                            self.finalize_pending_game(sender, None, None);
+                        }
+                        AddGameMode::Existing => {
+                            self.pending_game_id = None;
+                            self.pending_store = None;
+                            self.open_existing_source_folder_dialog(sender);
+                        }
+                    }
                 }
             }
             MainWindowMsg::InstallerFinished { capsule_dir, success } => {
@@ -1669,7 +2220,23 @@ impl SimpleComponent for MainWindow {
                 eprintln!("UMU database load failed: {}", error);
             }
             MainWindowMsg::UmuMatchChosen { game_id, store } => {
-                self.finalize_pending_game(sender, game_id, store);
+                match self.pending_add_mode {
+                    Some(AddGameMode::Installer) => {
+                        self.finalize_pending_game(sender, game_id, store);
+                    }
+                    Some(AddGameMode::Existing) => {
+                        if self.pending_game_name.is_none() {
+                            eprintln!("No pending game name for existing game");
+                            return;
+                        }
+                        self.pending_game_id = game_id;
+                        self.pending_store = store;
+                        self.open_existing_source_folder_dialog(sender);
+                    }
+                    None => {
+                        eprintln!("Add game mode not set");
+                    }
+                }
             }
             MainWindowMsg::UmuMatchDialogClosed => {
                 self.umu_match_dialog = None;
@@ -1729,6 +2296,25 @@ impl SimpleComponent for MainWindow {
                 if let Some(capsule_dir) = self.pending_settings_capsule.take() {
                     self.open_game_settings_dialog(sender, capsule_dir);
                 }
+            }
+            MainWindowMsg::LaunchGame(capsule_dir) => {
+                if self.active_games.contains_key(&capsule_dir) {
+                    return;
+                }
+                self.start_game(sender, capsule_dir);
+            }
+            MainWindowMsg::GameStarted { capsule_dir, pgid } => {
+                self.active_games.insert(capsule_dir, pgid);
+                self.rebuild_games_list(sender.clone());
+            }
+            MainWindowMsg::GameFinished { capsule_dir, success } => {
+                self.active_games.remove(&capsule_dir);
+                if success {
+                    println!("Game finished for {:?}", capsule_dir);
+                } else {
+                    eprintln!("Game failed for {:?}", capsule_dir);
+                }
+                self.rebuild_games_list(sender.clone());
             }
             MainWindowMsg::InstallerStarted { capsule_dir, pgid } => {
                 self.preparing_installs.remove(&capsule_dir);
