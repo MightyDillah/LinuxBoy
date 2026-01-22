@@ -1,5 +1,6 @@
 use gtk4::prelude::*;
 use gtk4::{Dialog, Box, Label, Button, Orientation, Grid, Separator, Frame, ProgressBar};
+use gtk4::gdk;
 use relm4::{ComponentParts, ComponentSender, RelmWidgetExt, SimpleComponent};
 
 use crate::core::system_checker::SystemCheck;
@@ -12,6 +13,8 @@ pub enum SystemSetupMsg {
     DownloadVersion(String),
     DownloadComplete,
     DownloadError(String),
+    CopyCommand(CommandKind),
+    RefreshStatus,
     Refresh(SystemCheck),
     Close,
 }
@@ -22,6 +25,15 @@ pub enum SystemSetupOutput {
     SystemCheckUpdated(SystemCheck),
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum CommandKind {
+    VulkanInstall,
+    VulkanReinstall,
+    MesaInstall,
+    MesaReinstall,
+    MissingPackages,
+}
+
 pub struct SystemSetupDialog {
     system_check: SystemCheck,
     runtime_mgr: RuntimeManager,
@@ -29,6 +41,56 @@ pub struct SystemSetupDialog {
     download_progress: f64,  // 0.0 to 1.0
     download_version: Option<String>,
     is_downloading: bool,
+}
+
+impl SystemSetupDialog {
+    fn vulkan_packages() -> [&'static str; 3] {
+        ["vulkan-tools", "libvulkan1", "libvulkan1:i386"]
+    }
+
+    fn mesa_packages() -> [&'static str; 6] {
+        [
+            "mesa-vulkan-drivers",
+            "mesa-vulkan-drivers:i386",
+            "libgl1-mesa-dri:amd64",
+            "libgl1-mesa-dri:i386",
+            "libglx-mesa0:amd64",
+            "libglx-mesa0:i386",
+        ]
+    }
+
+    fn apt_command(packages: &[&str], reinstall: bool) -> String {
+        if reinstall {
+            format!("sudo apt install --reinstall {}", packages.join(" "))
+        } else {
+            format!("sudo apt install {}", packages.join(" "))
+        }
+    }
+
+    fn command_for(&self, kind: CommandKind) -> Option<String> {
+        match kind {
+            CommandKind::VulkanInstall => Some(Self::apt_command(&Self::vulkan_packages(), false)),
+            CommandKind::VulkanReinstall => Some(Self::apt_command(&Self::vulkan_packages(), true)),
+            CommandKind::MesaInstall => Some(Self::apt_command(&Self::mesa_packages(), false)),
+            CommandKind::MesaReinstall => Some(Self::apt_command(&Self::mesa_packages(), true)),
+            CommandKind::MissingPackages => {
+                if self.system_check.missing_apt_packages.is_empty() {
+                    None
+                } else {
+                    Some(format!(
+                        "sudo apt install {}",
+                        self.system_check.missing_apt_packages.join(" ")
+                    ))
+                }
+            }
+        }
+    }
+
+    fn copy_to_clipboard(text: &str) {
+        if let Some(display) = gdk::Display::default() {
+            display.clipboard().set_text(text);
+        }
+    }
 }
 
 #[relm4::component(pub)]
@@ -104,15 +166,23 @@ impl SimpleComponent for SystemSetupDialog {
                         },
                         set_halign: gtk4::Align::Start,
                     },
-                    attach[2, 1, 1, 1] = &Label {
-                        #[watch]
-                        set_label: if model.system_check.vulkan_installed {
-                            "Reinstall: sudo apt install --reinstall vulkan-tools libvulkan1 libvulkan1:i386"
-                        } else {
-                            "Run: sudo apt install vulkan-tools"
+                    attach[2, 1, 1, 1] = &Box {
+                        set_orientation: Orientation::Horizontal,
+                        set_spacing: 8,
+
+                        append = &Button {
+                            #[watch]
+                            set_visible: !model.system_check.vulkan_installed,
+                            set_label: "Copy install cmd",
+                            connect_clicked => SystemSetupMsg::CopyCommand(CommandKind::VulkanInstall),
                         },
-                        set_halign: gtk4::Align::Start,
-                        set_wrap: true,
+
+                        append = &Button {
+                            #[watch]
+                            set_visible: model.system_check.vulkan_installed,
+                            set_label: "Copy reinstall cmd",
+                            connect_clicked => SystemSetupMsg::CopyCommand(CommandKind::VulkanReinstall),
+                        },
                     },
 
                     // Row 2: Mesa
@@ -129,15 +199,23 @@ impl SimpleComponent for SystemSetupDialog {
                         },
                         set_halign: gtk4::Align::Start,
                     },
-                    attach[2, 2, 1, 1] = &Label {
-                        #[watch]
-                        set_label: if model.system_check.mesa_installed {
-                            "Reinstall: sudo apt install --reinstall mesa-vulkan-drivers mesa-vulkan-drivers:i386 libgl1-mesa-dri:amd64 libgl1-mesa-dri:i386 libgl1-mesa-glx:amd64 libgl1-mesa-glx:i386"
-                        } else {
-                            "Run: sudo apt install mesa-vulkan-drivers"
+                    attach[2, 2, 1, 1] = &Box {
+                        set_orientation: Orientation::Horizontal,
+                        set_spacing: 8,
+
+                        append = &Button {
+                            #[watch]
+                            set_visible: !model.system_check.mesa_installed,
+                            set_label: "Copy install cmd",
+                            connect_clicked => SystemSetupMsg::CopyCommand(CommandKind::MesaInstall),
                         },
-                        set_halign: gtk4::Align::Start,
-                        set_wrap: true,
+
+                        append = &Button {
+                            #[watch]
+                            set_visible: model.system_check.mesa_installed,
+                            set_label: "Copy reinstall cmd",
+                            connect_clicked => SystemSetupMsg::CopyCommand(CommandKind::MesaReinstall),
+                        },
                     },
 
                     // Row 3: Proton-GE
@@ -209,6 +287,12 @@ impl SimpleComponent for SystemSetupDialog {
                         set_label: "Install the following packages to enable Vulkan support:",
                         set_halign: gtk4::Align::Start,
                         set_wrap: true,
+                    },
+
+                    append = &Button {
+                        set_halign: gtk4::Align::Start,
+                        set_label: "Copy install command",
+                        connect_clicked => SystemSetupMsg::CopyCommand(CommandKind::MissingPackages),
                     },
 
                     append = &Frame {
@@ -290,6 +374,11 @@ impl SimpleComponent for SystemSetupDialog {
                     set_orientation: Orientation::Horizontal,
                     set_spacing: 10,
                     set_halign: gtk4::Align::End,
+
+                    append = &Button {
+                        set_label: "Refresh Status",
+                        connect_clicked => SystemSetupMsg::RefreshStatus,
+                    },
 
                     append = &Button {
                         set_label: "Close",
@@ -445,6 +534,22 @@ impl SimpleComponent for SystemSetupDialog {
                 self.is_downloading = false;
                 self.download_status = format!("✗ Error: {}", error);
                 self.download_progress = 0.0;
+            }
+
+            SystemSetupMsg::CopyCommand(kind) => {
+                if let Some(command) = self.command_for(kind) {
+                    Self::copy_to_clipboard(&command);
+                    println!("Copied to clipboard: {}", command);
+                } else {
+                    println!("No command available to copy");
+                }
+            }
+
+            SystemSetupMsg::RefreshStatus => {
+                self.system_check = SystemCheck::check();
+                let _ = sender.output(SystemSetupOutput::SystemCheckUpdated(
+                    self.system_check.clone(),
+                ));
             }
 
             SystemSetupMsg::Refresh(system_check) => {

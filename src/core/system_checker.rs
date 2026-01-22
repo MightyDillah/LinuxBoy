@@ -37,8 +37,8 @@ impl SystemCheck {
             missing_apt_packages.push("mesa-vulkan-drivers:i386".to_string());
             missing_apt_packages.push("libgl1-mesa-dri:amd64".to_string());
             missing_apt_packages.push("libgl1-mesa-dri:i386".to_string());
-            missing_apt_packages.push("libgl1-mesa-glx:amd64".to_string());
-            missing_apt_packages.push("libgl1-mesa-glx:i386".to_string());
+            missing_apt_packages.push("libglx-mesa0:amd64".to_string());
+            missing_apt_packages.push("libglx-mesa0:i386".to_string());
         }
 
         // Determine overall status
