@@ -3,6 +3,7 @@ use gtk4::{Dialog, Box, Label, Button, Orientation, Grid, Separator, Frame, Prog
 use relm4::{ComponentParts, ComponentSender, RelmWidgetExt, SimpleComponent};
 use serde::Deserialize;
 use std::io::{BufRead, BufReader};
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 use crate::core::system_checker::SystemCheck;
@@ -19,6 +20,7 @@ pub enum SystemSetupMsg {
     RunUmuInstall { reinstall: bool },
     InstallLog(String),
     InstallFinished { success: bool, message: String },
+    InstallVersion { kind: InstallKind, version: String },
     RefreshStatus,
     Refresh(SystemCheck),
     Close,
@@ -37,6 +39,12 @@ pub enum InstallTarget {
     MissingPackages,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InstallKind {
+    Apt(InstallTarget),
+    Umu,
+}
+
 pub struct SystemSetupDialog {
     system_check: SystemCheck,
     runtime_mgr: RuntimeManager,
@@ -47,6 +55,10 @@ pub struct SystemSetupDialog {
     install_status: String,
     install_log: String,
     install_running: bool,
+    install_kind: Option<InstallKind>,
+    proton_installed_version: Option<String>,
+    umu_installed_version: Option<String>,
+    pending_umu_version: Option<String>,
 }
 
 impl SystemSetupDialog {
@@ -91,6 +103,23 @@ impl SystemSetupDialog {
             "arm" => Some("armhf"),
             _ => None,
         }
+    }
+
+    fn resolve_command(name: &str, fallback_paths: &[&str]) -> Option<String> {
+        for path in fallback_paths {
+            if Path::new(path).exists() {
+                return Some(path.to_string());
+            }
+        }
+        if let Some(paths) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&paths) {
+                let candidate = dir.join(name);
+                if candidate.exists() {
+                    return Some(candidate.to_string_lossy().to_string());
+                }
+            }
+        }
+        None
     }
 
     fn select_umu_asset(assets: &[UmuAsset], debian_version: &str, arch: &str) -> Option<UmuAsset> {
@@ -199,6 +228,7 @@ struct UmuAsset {
 #[derive(Debug)]
 enum InstallUpdate {
     Log(String),
+    Version { kind: InstallKind, version: String },
     Finished { success: bool, message: String },
 }
 
@@ -355,9 +385,16 @@ impl SimpleComponent for SystemSetupDialog {
                     attach[1, 3, 1, 1] = &Label {
                         #[watch]
                         set_markup: if model.system_check.umu_installed {
-                            "<span foreground='#2ecc71'>✓ Installed</span>"
+                            if let Some(version) = &model.umu_installed_version {
+                                format!(
+                                    "<span foreground='#2ecc71'>✓ Installed ({})</span>",
+                                    version
+                                )
+                            } else {
+                                "<span foreground='#2ecc71'>✓ Installed</span>".to_string()
+                            }
                         } else {
-                            "<span foreground='#e74c3c'>✗ Missing</span>"
+                            "<span foreground='#e74c3c'>✗ Missing</span>".to_string()
                         },
                         set_halign: gtk4::Align::Start,
                     },
@@ -392,9 +429,16 @@ impl SimpleComponent for SystemSetupDialog {
                     attach[1, 4, 1, 1] = &Label {
                         #[watch]
                         set_markup: if model.system_check.proton_installed {
-                            "<span foreground='#2ecc71'>✓ Installed</span>"
+                            if let Some(version) = &model.proton_installed_version {
+                                format!(
+                                    "<span foreground='#2ecc71'>✓ Installed ({})</span>",
+                                    version
+                                )
+                            } else {
+                                "<span foreground='#2ecc71'>✓ Installed</span>".to_string()
+                            }
                         } else {
-                            "<span foreground='#f39c12'>✗ Not Downloaded</span>"
+                            "<span foreground='#f39c12'>✗ Not Downloaded</span>".to_string()
                         },
                         set_halign: gtk4::Align::Start,
                     },
@@ -601,6 +645,13 @@ impl SimpleComponent for SystemSetupDialog {
         _sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
         let runtime_mgr = RuntimeManager::new();
+        let proton_installed_version = runtime_mgr
+            .list_installed()
+            .ok()
+            .and_then(|mut versions| {
+                versions.sort();
+                versions.last().cloned()
+            });
 
         let model = SystemSetupDialog {
             system_check,
@@ -612,6 +663,10 @@ impl SimpleComponent for SystemSetupDialog {
             install_status: String::new(),
             install_log: String::new(),
             install_running: false,
+            install_kind: None,
+            proton_installed_version,
+            umu_installed_version: None,
+            pending_umu_version: None,
         };
 
         let widgets = view_output!();
@@ -732,6 +787,7 @@ impl SimpleComponent for SystemSetupDialog {
                     .unwrap_or("latest");
                 self.download_status = format!("✓ Proton-GE {} installed successfully!", version);
                 self.download_progress = 1.0;
+                self.proton_installed_version = self.download_version.clone();
                 // Refresh system check
                 self.system_check = SystemCheck::check();
                 let _ = sender.output(SystemSetupOutput::SystemCheckUpdated(
@@ -750,6 +806,26 @@ impl SimpleComponent for SystemSetupDialog {
                     return;
                 }
 
+                self.install_kind = Some(InstallKind::Apt(target));
+                let pkexec_path = match Self::resolve_command("pkexec", &["/usr/bin/pkexec", "/bin/pkexec"]) {
+                    Some(path) => path,
+                    None => {
+                        self.install_status = "Install failed.".to_string();
+                        self.install_log = "pkexec not found. Install policykit-1 to enable GUI installs.".to_string();
+                        return;
+                    }
+                };
+                let apt_path = match Self::resolve_command(
+                    "apt",
+                    &["/usr/bin/apt", "/bin/apt", "/usr/bin/apt-get", "/bin/apt-get"],
+                ) {
+                    Some(path) => path,
+                    None => {
+                        self.install_status = "Install failed.".to_string();
+                        self.install_log = "apt not found in PATH.".to_string();
+                        return;
+                    }
+                };
                 let packages: Vec<String> = match target {
                     InstallTarget::Vulkan => Self::vulkan_packages().iter().map(|s| s.to_string()).collect(),
                     InstallTarget::Mesa => Self::mesa_packages().iter().map(|s| s.to_string()).collect(),
@@ -774,10 +850,10 @@ impl SimpleComponent for SystemSetupDialog {
                 let (tx, rx) = std::sync::mpsc::channel::<InstallUpdate>();
 
                 std::thread::spawn(move || {
-                    let mut cmd = Command::new("pkexec");
+                    let mut cmd = Command::new(pkexec_path);
                     cmd.arg("env")
                         .arg("DEBIAN_FRONTEND=noninteractive")
-                        .arg("apt")
+                        .arg(apt_path)
                         .arg("install")
                         .arg("-y");
                     if reinstall {
@@ -802,6 +878,9 @@ impl SimpleComponent for SystemSetupDialog {
                             InstallUpdate::Log(line) => {
                                 let _ = sender_clone.input(SystemSetupMsg::InstallLog(line));
                             }
+                            InstallUpdate::Version { kind, version } => {
+                                let _ = sender_clone.input(SystemSetupMsg::InstallVersion { kind, version });
+                            }
                             InstallUpdate::Finished { success, message } => {
                                 finished = Some((success, message));
                             }
@@ -825,6 +904,26 @@ impl SimpleComponent for SystemSetupDialog {
                     return;
                 }
 
+                self.install_kind = Some(InstallKind::Umu);
+                let pkexec_path = match Self::resolve_command("pkexec", &["/usr/bin/pkexec", "/bin/pkexec"]) {
+                    Some(path) => path,
+                    None => {
+                        self.install_status = "Install failed.".to_string();
+                        self.install_log = "pkexec not found. Install policykit-1 to enable GUI installs.".to_string();
+                        return;
+                    }
+                };
+                let apt_path = match Self::resolve_command(
+                    "apt",
+                    &["/usr/bin/apt", "/bin/apt", "/usr/bin/apt-get", "/bin/apt-get"],
+                ) {
+                    Some(path) => path,
+                    None => {
+                        self.install_status = "Install failed.".to_string();
+                        self.install_log = "apt not found in PATH.".to_string();
+                        return;
+                    }
+                };
                 self.install_running = true;
                 self.install_log.clear();
                 self.install_status = if reinstall {
@@ -872,6 +971,10 @@ impl SimpleComponent for SystemSetupDialog {
                             "Latest release: {}",
                             release.tag_name
                         )));
+                        let _ = tx.send(InstallUpdate::Version {
+                            kind: InstallKind::Umu,
+                            version: release.tag_name.clone(),
+                        });
                         let asset = Self::select_umu_asset(&release.assets, &version_id, arch)
                             .ok_or_else(|| "No matching .deb asset found for this distro/arch".to_string())?;
 
@@ -912,10 +1015,10 @@ impl SimpleComponent for SystemSetupDialog {
                             "Download complete. Installing package...".to_string(),
                         ));
 
-                        let mut cmd = Command::new("pkexec");
+                        let mut cmd = Command::new(pkexec_path);
                         cmd.arg("env")
                             .arg("DEBIAN_FRONTEND=noninteractive")
-                            .arg("apt")
+                            .arg(apt_path)
                             .arg("install")
                             .arg("-y");
                         if reinstall {
@@ -941,6 +1044,9 @@ impl SimpleComponent for SystemSetupDialog {
                         match update {
                             InstallUpdate::Log(line) => {
                                 let _ = sender_clone.input(SystemSetupMsg::InstallLog(line));
+                            }
+                            InstallUpdate::Version { kind, version } => {
+                                let _ = sender_clone.input(SystemSetupMsg::InstallVersion { kind, version });
                             }
                             InstallUpdate::Finished { success, message } => {
                                 finished = Some((success, message));
@@ -969,6 +1075,7 @@ impl SimpleComponent for SystemSetupDialog {
 
             SystemSetupMsg::InstallFinished { success, message } => {
                 self.install_running = false;
+                let completed_kind = self.install_kind.take();
                 self.install_status = if success {
                     "Install completed.".to_string()
                 } else {
@@ -980,14 +1087,42 @@ impl SimpleComponent for SystemSetupDialog {
                     }
                     self.install_log.push_str(&message);
                 }
+                if success && completed_kind == Some(InstallKind::Umu) {
+                    if let Some(version) = self.pending_umu_version.take() {
+                        self.umu_installed_version = Some(version);
+                    }
+                } else if !success {
+                    self.pending_umu_version = None;
+                }
                 self.system_check = SystemCheck::check();
                 let _ = sender.output(SystemSetupOutput::SystemCheckUpdated(
                     self.system_check.clone(),
                 ));
             }
 
+            SystemSetupMsg::InstallVersion { kind, version } => {
+                if kind == InstallKind::Umu {
+                    self.pending_umu_version = Some(version);
+                }
+            }
+
             SystemSetupMsg::RefreshStatus => {
                 self.system_check = SystemCheck::check();
+                if self.system_check.proton_installed {
+                    self.proton_installed_version = self
+                        .runtime_mgr
+                        .list_installed()
+                        .ok()
+                        .and_then(|mut versions| {
+                            versions.sort();
+                            versions.last().cloned()
+                        });
+                } else {
+                    self.proton_installed_version = None;
+                }
+                if !self.system_check.umu_installed {
+                    self.umu_installed_version = None;
+                }
                 let _ = sender.output(SystemSetupOutput::SystemCheckUpdated(
                     self.system_check.clone(),
                 ));
