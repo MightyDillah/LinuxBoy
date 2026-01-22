@@ -1,0 +1,93 @@
+.app-title {
+  font-size: 20px;
+  font-weight: 700;
+}
+
+.section-title {
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.card-title {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.muted {
+  opacity: 0.7;
+}
+
+.card {
+  background-color: alpha(@theme_fg_color, 0.04);
+  border: 1px solid alpha(@theme_fg_color, 0.08);
+  border-radius: 12px;
+  padding: 12px;
+}
+
+.setup-row {
+  padding: 12px;
+}
+
+.pill {
+  border-radius: 999px;
+  padding: 2px 10px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.pill-installed {
+  background-color: alpha(#2ecc71, 0.2);
+  color: #2ecc71;
+}
+
+.pill-warning {
+  background-color: alpha(#f39c12, 0.2);
+  color: #f39c12;
+}
+
+.pill-missing {
+  background-color: alpha(#e74c3c, 0.2);
+  color: #e74c3c;
+}
+
+.status-label {
+  font-weight: 600;
+}
+
+.status-ready {
+  color: #2ecc71;
+}
+
+.status-warning {
+  color: #f39c12;
+}
+
+.status-missing {
+  color: #e74c3c;
+}
+
+.topbar {
+  border-bottom: 1px solid alpha(@theme_fg_color, 0.08);
+}
+
+.tab-switcher button {
+  padding: 6px 12px;
+  border-radius: 8px;
+}
+
+.status-bar {
+  border-top: 1px solid alpha(@theme_fg_color, 0.08);
+}
+
+button.accent {
+  background-color: @theme_selected_bg_color;
+  color: @theme_selected_fg_color;
+  border-radius: 8px;
+  padding: 6px 12px;
+}
+
+button.secondary {
+  background-color: alpha(@theme_fg_color, 0.08);
+  border-radius: 8px;
+  padding: 6px 12px;
+}

@@ -1,7 +1,8 @@
 use gtk4::prelude::*;
 use gtk4::{
     ApplicationWindow, Box, Button, Dialog, Entry, FileChooserAction, FileChooserNative,
-    FileFilter, Label, Orientation, ResponseType, ScrolledWindow,
+    FileFilter, Image, Label, Orientation, ResponseType, ScrolledWindow, Stack, StackSwitcher,
+    StackTransitionType,
 };
 use relm4::{Component, ComponentParts, ComponentSender, RelmWidgetExt, SimpleComponent};
 use relm4::component::{ComponentController, Controller};
@@ -52,10 +53,32 @@ pub struct MainWindow {
     pending_installer_path: Option<PathBuf>,
     active_installs: HashMap<PathBuf, i32>,
     games_list: Box,
+    library_count_label: Label,
+    system_status_label: Label,
+    system_status_detail: Label,
     root_window: ApplicationWindow,
 }
 
 impl MainWindow {
+    fn update_library_labels(&self) {
+        self.library_count_label
+            .set_label(&format!("{} games", self.capsules.len()));
+    }
+
+    fn update_system_labels(&self) {
+        let (title, class) = match self.system_check.status {
+            SystemStatus::AllInstalled => ("System Ready", "status-ready"),
+            SystemStatus::PartiallyInstalled => ("Setup Incomplete", "status-warning"),
+            SystemStatus::NothingInstalled => ("Setup Required", "status-missing"),
+        };
+
+        self.system_status_label.set_label(title);
+        self.system_status_label
+            .set_css_classes(&["status-label", class]);
+        self.system_status_detail
+            .set_label(&self.system_check.status_message());
+    }
+
     fn sanitize_name(name: &str) -> String {
         name.trim()
             .replace(['/', '\\'], "_")
@@ -289,33 +312,90 @@ impl MainWindow {
         }
 
         if self.capsules.is_empty() {
-            let empty = Label::new(Some("No games installed yet."));
-            empty.set_halign(gtk4::Align::Start);
+            let empty = Box::new(Orientation::Vertical, 6);
+            empty.set_margin_all(8);
+            empty.set_css_classes(&["card"]);
+
+            let icon = Image::from_icon_name("applications-games-symbolic");
+            icon.set_pixel_size(32);
+
+            let title = Label::new(Some("No games yet"));
+            title.set_css_classes(&["card-title"]);
+            title.set_halign(gtk4::Align::Start);
+
+            let subtitle = Label::new(Some(
+                "Add an installer to create your first portable capsule.",
+            ));
+            subtitle.set_css_classes(&["muted"]);
+            subtitle.set_halign(gtk4::Align::Start);
+            subtitle.set_wrap(true);
+
+            empty.append(&icon);
+            empty.append(&title);
+            empty.append(&subtitle);
             list.append(&empty);
             return;
         }
 
         for capsule in &self.capsules {
-            let row = Box::new(Orientation::Horizontal, 12);
-            row.set_margin_all(8);
-            row.set_hexpand(true);
+            let card = Box::new(Orientation::Vertical, 8);
+            card.set_margin_bottom(12);
+            card.set_hexpand(true);
+            card.set_css_classes(&["card"]);
+
+            let header = Box::new(Orientation::Horizontal, 10);
+            header.set_hexpand(true);
+
+            let icon = Image::from_icon_name("applications-games-symbolic");
+            icon.set_pixel_size(24);
 
             let name = Label::new(Some(&capsule.name));
             name.set_halign(gtk4::Align::Start);
             name.set_hexpand(true);
+            name.set_css_classes(&["card-title"]);
 
             let status_text = match capsule.metadata.install_state {
                 InstallState::Installing => "Installing",
                 InstallState::Installed => "Installed",
             };
+            let status_class = match capsule.metadata.install_state {
+                InstallState::Installing => "pill-warning",
+                InstallState::Installed => "pill-installed",
+            };
             let status = Label::new(Some(status_text));
-            status.set_halign(gtk4::Align::Start);
+            status.set_css_classes(&["pill", status_class]);
+
+            let spacer = Box::new(Orientation::Horizontal, 0);
+            spacer.set_hexpand(true);
+
+            header.append(&icon);
+            header.append(&name);
+            header.append(&spacer);
+            header.append(&status);
+
+            let installing = capsule.metadata.install_state == InstallState::Installing;
+            let is_running = self.active_installs.contains_key(&capsule.capsule_dir);
+            let detail_text = if installing {
+                if is_running {
+                    "Installer running"
+                } else {
+                    "Installer paused"
+                }
+            } else {
+                "Ready to play"
+            };
+
+            let detail = Label::new(Some(detail_text));
+            detail.set_css_classes(&["muted"]);
+            detail.set_halign(gtk4::Align::Start);
 
             let actions = Box::new(Orientation::Horizontal, 8);
+            actions.set_halign(gtk4::Align::Start);
 
             let edit_dir = capsule.capsule_dir.clone();
             let edit_sender = sender.clone();
             let edit_button = Button::with_label("Edit");
+            edit_button.add_css_class("flat");
             edit_button.connect_clicked(move |_| {
                 edit_sender.input(MainWindowMsg::EditGame(edit_dir.clone()));
             });
@@ -324,18 +404,17 @@ impl MainWindow {
             let delete_dir = capsule.capsule_dir.clone();
             let delete_sender = sender.clone();
             let delete_button = Button::with_label("Delete");
+            delete_button.add_css_class("destructive-action");
             delete_button.connect_clicked(move |_| {
                 delete_sender.input(MainWindowMsg::DeleteGame(delete_dir.clone()));
             });
             actions.append(&delete_button);
 
-            let installing = capsule.metadata.install_state == InstallState::Installing;
-            let is_running = self.active_installs.contains_key(&capsule.capsule_dir);
-
             if installing && is_running {
                 let kill_dir = capsule.capsule_dir.clone();
                 let kill_sender = sender.clone();
                 let kill_button = Button::with_label("Kill installer");
+                kill_button.add_css_class("destructive-action");
                 kill_button.connect_clicked(move |_| {
                     kill_sender.input(MainWindowMsg::KillInstall(kill_dir.clone()));
                 });
@@ -344,16 +423,17 @@ impl MainWindow {
                 let resume_dir = capsule.capsule_dir.clone();
                 let resume_sender = sender.clone();
                 let resume_button = Button::with_label("Resume setup");
+                resume_button.add_css_class("suggested-action");
                 resume_button.connect_clicked(move |_| {
                     resume_sender.input(MainWindowMsg::ResumeInstall(resume_dir.clone()));
                 });
                 actions.append(&resume_button);
             }
 
-            row.append(&name);
-            row.append(&status);
-            row.append(&actions);
-            list.append(&row);
+            card.append(&header);
+            card.append(&detail);
+            card.append(&actions);
+            list.append(&card);
         }
     }
 }
@@ -369,23 +449,46 @@ impl SimpleComponent for MainWindow {
         #[root]
         ApplicationWindow {
             set_title: Some("LinuxBoy"),
-            set_default_width: 1000,
-            set_default_height: 700,
+            set_default_width: 1100,
+            set_default_height: 720,
 
             #[wrap(Some)]
             set_child = &Box {
                 set_orientation: Orientation::Vertical,
                 set_spacing: 0,
+                set_hexpand: true,
+                set_vexpand: true,
 
                 // Header bar
                 append = &Box {
                     set_orientation: Orientation::Horizontal,
-                    set_spacing: 10,
-                    set_margin_all: 10,
+                    set_spacing: 12,
+                    set_margin_start: 20,
+                    set_margin_end: 20,
+                    set_margin_top: 16,
+                    set_margin_bottom: 12,
+                    set_css_classes: &["topbar"],
 
-                    append = &Label {
-                        set_label: "LinuxBoy Gaming Manager",
-                        set_css_classes: &["title"],
+                    append = &Image {
+                        set_icon_name: Some("applications-games-symbolic"),
+                        set_pixel_size: 28,
+                    },
+
+                    append = &Box {
+                        set_orientation: Orientation::Vertical,
+                        set_spacing: 2,
+
+                        append = &Label {
+                            set_label: "LinuxBoy",
+                            set_css_classes: &["app-title"],
+                            set_halign: gtk4::Align::Start,
+                        },
+
+                        append = &Label {
+                            set_label: "Portable game manager for Proton-GE",
+                            set_css_classes: &["muted"],
+                            set_halign: gtk4::Align::Start,
+                        },
                     },
 
                     append = &Box {
@@ -393,76 +496,77 @@ impl SimpleComponent for MainWindow {
                     },
 
                     append = &Button {
-                        set_label: "+ Add Game",
+                        set_label: "System Setup",
+                        set_css_classes: &["secondary"],
+                        connect_clicked => MainWindowMsg::OpenSystemSetup,
+                    },
+
+                    append = &Button {
+                        set_label: "Add Game",
+                        set_css_classes: &["accent"],
                         connect_clicked => MainWindowMsg::OpenInstaller,
                     },
                 },
 
-                // Main content
+                // Tabs
                 append = &Box {
                     set_orientation: Orientation::Horizontal,
-                    set_spacing: 0,
+                    set_margin_start: 20,
+                    set_margin_end: 20,
+                    set_margin_bottom: 8,
+
+                    append = &StackSwitcher {
+                        set_stack: Some(&main_stack),
+                        set_css_classes: &["tab-switcher"],
+                    },
+                },
+
+                // Main content area
+                append = &Box {
+                    set_orientation: Orientation::Vertical,
                     set_hexpand: true,
                     set_vexpand: true,
+                    set_margin_start: 12,
+                    set_margin_end: 12,
 
-                    // Sidebar
-                    append = &Box {
-                        set_orientation: Orientation::Vertical,
-                        set_width_request: 200,
-                        set_css_classes: &["sidebar"],
-
-                        append = &Button {
-                            set_label: "Library",
-                            set_margin_all: 5,
-                        },
-
-                        append = &Button {
-                            set_label: "System Check",
-                            set_margin_all: 5,
-                        },
-
-                        append = &Button {
-                            set_label: "Settings",
-                            set_margin_all: 5,
-                        },
-                    },
-
-                    // Main content area
-                    append = &ScrolledWindow {
-                        set_hexpand: true,
-                        set_vexpand: true,
-
-                    #[wrap(Some)]
                     #[local_ref]
-                    set_child = &games_list -> Box {},
-                    },
+                    main_stack -> Stack {},
                 },
 
                 // Status bar
                 append = &Box {
                     set_orientation: Orientation::Horizontal,
-                    set_spacing: 10,
-                    set_margin_all: 5,
+                    set_spacing: 12,
+                    set_margin_start: 20,
+                    set_margin_end: 20,
+                    set_margin_top: 8,
+                    set_margin_bottom: 16,
+                    set_css_classes: &["status-bar"],
 
                     append = &Label {
                         #[watch]
-                        set_label: &format!("{} games installed", model.capsules.len()),
+                        set_label: &format!("{} games", model.capsules.len()),
+                        set_css_classes: &["muted"],
                     },
 
                     append = &Box {
                         set_hexpand: true,
                     },
 
-                    // System status indicator
-                    append = &Button {
+                    append = &Label {
                         #[watch]
                         set_label: &match model.system_check.status {
-                            SystemStatus::AllInstalled => "🟢 System Ready",
-                            SystemStatus::PartiallyInstalled => "🟠 Setup Incomplete",
-                            SystemStatus::NothingInstalled => "🔴 Setup Required",
+                            SystemStatus::AllInstalled => "System Ready",
+                            SystemStatus::PartiallyInstalled => "Setup Incomplete",
+                            SystemStatus::NothingInstalled => "Setup Required",
                         },
-                        set_tooltip_text: Some(&model.system_check.status_message()),
-                        connect_clicked => MainWindowMsg::OpenSystemSetup,
+                        #[watch]
+                        set_css_classes: &match model.system_check.status {
+                            SystemStatus::AllInstalled => ["pill", "pill-installed"],
+                            SystemStatus::PartiallyInstalled => ["pill", "pill-warning"],
+                            SystemStatus::NothingInstalled => ["pill", "pill-missing"],
+                        },
+                        set_halign: gtk4::Align::End,
                     },
                 },
             },
@@ -483,8 +587,110 @@ impl SimpleComponent for MainWindow {
         println!("System check: {:?}", system_check.status);
 
         let games_list = Box::new(Orientation::Vertical, 12);
-        games_list.set_margin_all(20);
+        games_list.set_margin_all(12);
         games_list.set_valign(gtk4::Align::Start);
+        games_list.set_hexpand(true);
+
+        let library_count_label = Label::new(None);
+        library_count_label.set_css_classes(&["muted"]);
+        library_count_label.set_halign(gtk4::Align::Start);
+
+        let system_status_label = Label::new(None);
+        system_status_label.set_halign(gtk4::Align::Start);
+
+        let system_status_detail = Label::new(None);
+        system_status_detail.set_css_classes(&["muted"]);
+        system_status_detail.set_halign(gtk4::Align::Start);
+        system_status_detail.set_wrap(true);
+
+        let main_stack = Stack::new();
+        main_stack.set_hexpand(true);
+        main_stack.set_vexpand(true);
+        main_stack.set_transition_type(StackTransitionType::SlideLeftRight);
+
+        let library_page = Box::new(Orientation::Vertical, 16);
+        library_page.set_margin_all(20);
+        library_page.set_hexpand(true);
+        library_page.set_vexpand(true);
+
+        let library_header = Box::new(Orientation::Horizontal, 12);
+        library_header.set_hexpand(true);
+
+        let library_icon = Image::from_icon_name("folder-open-symbolic");
+        library_icon.set_pixel_size(24);
+
+        let library_title = Label::new(Some("Library"));
+        library_title.set_css_classes(&["section-title"]);
+        library_title.set_halign(gtk4::Align::Start);
+
+        let library_spacer = Box::new(Orientation::Horizontal, 0);
+        library_spacer.set_hexpand(true);
+
+        library_header.append(&library_icon);
+        library_header.append(&library_title);
+        library_header.append(&library_spacer);
+        library_header.append(&library_count_label);
+
+        let library_card = Box::new(Orientation::Vertical, 0);
+        library_card.set_css_classes(&["card"]);
+        library_card.set_hexpand(true);
+        library_card.set_vexpand(true);
+
+        let games_scroller = ScrolledWindow::new();
+        games_scroller.set_hexpand(true);
+        games_scroller.set_vexpand(true);
+        games_scroller.set_child(Some(&games_list));
+        library_card.append(&games_scroller);
+
+        library_page.append(&library_header);
+        library_page.append(&library_card);
+
+        let system_page = Box::new(Orientation::Vertical, 16);
+        system_page.set_margin_all(20);
+        system_page.set_hexpand(true);
+        system_page.set_vexpand(true);
+
+        let system_header = Box::new(Orientation::Horizontal, 12);
+        system_header.set_hexpand(true);
+
+        let system_icon = Image::from_icon_name("preferences-system-symbolic");
+        system_icon.set_pixel_size(24);
+
+        let system_title = Label::new(Some("System"));
+        system_title.set_css_classes(&["section-title"]);
+        system_title.set_halign(gtk4::Align::Start);
+
+        system_header.append(&system_icon);
+        system_header.append(&system_title);
+
+        let system_card = Box::new(Orientation::Horizontal, 16);
+        system_card.set_css_classes(&["card"]);
+        system_card.set_hexpand(true);
+
+        let status_box = Box::new(Orientation::Vertical, 6);
+        status_box.set_hexpand(true);
+        status_box.append(&system_status_label);
+        status_box.append(&system_status_detail);
+
+        let system_actions = Box::new(Orientation::Horizontal, 8);
+        system_actions.set_halign(gtk4::Align::End);
+
+        let setup_button = Button::with_label("Open System Setup");
+        setup_button.add_css_class("accent");
+        let setup_sender = sender.clone();
+        setup_button.connect_clicked(move |_| {
+            setup_sender.input(MainWindowMsg::OpenSystemSetup);
+        });
+        system_actions.append(&setup_button);
+
+        system_card.append(&status_box);
+        system_card.append(&system_actions);
+
+        system_page.append(&system_header);
+        system_page.append(&system_card);
+
+        main_stack.add_titled(&library_page, Some("library"), "Library");
+        main_stack.add_titled(&system_page, Some("system"), "System");
 
         let model = MainWindow {
             capsules: Vec::new(),
@@ -497,8 +703,14 @@ impl SimpleComponent for MainWindow {
             pending_installer_path: None,
             active_installs: HashMap::new(),
             games_list: games_list.clone(),
+            library_count_label,
+            system_status_label,
+            system_status_detail,
             root_window: root.clone(),
         };
+
+        model.update_library_labels();
+        model.update_system_labels();
 
         let widgets = view_output!();
 
@@ -515,6 +727,7 @@ impl SimpleComponent for MainWindow {
                     Ok(capsules) => {
                         self.capsules = capsules;
                         println!("Loaded {} capsules", self.capsules.len());
+                        self.update_library_labels();
                         self.rebuild_games_list(sender.clone());
                     }
                     Err(e) => {
@@ -647,6 +860,7 @@ impl SimpleComponent for MainWindow {
             MainWindowMsg::OpenSystemSetup => {
                 // Re-check system status before opening dialog
                 self.system_check = SystemCheck::check();
+                self.update_system_labels();
                 
                 println!("Opening system setup dialog...");
                 
@@ -668,6 +882,7 @@ impl SimpleComponent for MainWindow {
             }
             MainWindowMsg::SystemSetupOutput(SystemSetupOutput::SystemCheckUpdated(system_check)) => {
                 self.system_check = system_check;
+                self.update_system_labels();
             }
         }
     }
