@@ -1,5 +1,5 @@
 use gtk4::prelude::*;
-use gtk4::{Dialog, Box, Label, Button, Orientation, Grid, Separator, Frame};
+use gtk4::{Dialog, Box, Label, Button, Orientation, Grid, Separator, Frame, ProgressBar};
 use relm4::{ComponentParts, ComponentSender, RelmWidgetExt, SimpleComponent};
 
 use crate::core::system_checker::SystemCheck;
@@ -8,7 +8,7 @@ use crate::core::runtime_manager::RuntimeManager;
 #[derive(Debug)]
 pub enum SystemSetupMsg {
     DownloadProton,
-    DownloadProgress(String),  // Progress message
+    DownloadProgress { status: String, progress: f64 },  // status text and 0.0-1.0 progress
     DownloadComplete,
     DownloadError(String),
     Close,
@@ -18,6 +18,7 @@ pub struct SystemSetupDialog {
     system_check: SystemCheck,
     runtime_mgr: RuntimeManager,
     download_status: String,
+    download_progress: f64,  // 0.0 to 1.0
     is_downloading: bool,
 }
 
@@ -33,7 +34,7 @@ impl SimpleComponent for SystemSetupDialog {
             set_title: Some("System Setup"),
             set_modal: true,
             set_default_width: 700,
-            set_default_height: 450,
+            set_default_height: 500,
 
             #[wrap(Some)]
             set_child = &Box {
@@ -156,31 +157,6 @@ impl SimpleComponent for SystemSetupDialog {
                         set_sensitive: !model.is_downloading,
                         connect_clicked => SystemSetupMsg::DownloadProton,
                     },
-
-                    // Row 4: Wine
-                    attach[0, 4, 1, 1] = &Label {
-                        set_label: "Wine",
-                        set_halign: gtk4::Align::Start,
-                    },
-                    attach[1, 4, 1, 1] = &Label {
-                        #[watch]
-                        set_markup: if model.system_check.wine_installed {
-                            "<span foreground='#2ecc71'>✓ Installed</span>"
-                        } else {
-                            "<span foreground='#f39c12'>⚠ Optional</span>"
-                        },
-                        set_halign: gtk4::Align::Start,
-                    },
-                    attach[2, 4, 1, 1] = &Label {
-                        #[watch]
-                        set_label: if model.system_check.wine_installed {
-                            ""
-                        } else {
-                            "Optional: Run sudo apt install wine"
-                        },
-                        set_halign: gtk4::Align::Start,
-                        set_wrap: true,
-                    },
                 },
 
                 // Missing APT packages section
@@ -229,10 +205,10 @@ impl SimpleComponent for SystemSetupDialog {
                 // Download status area
                 append = &Box {
                     set_orientation: Orientation::Vertical,
-                    set_spacing: 5,
+                    set_spacing: 10,
                     set_margin_top: 10,
                     #[watch]
-                    set_visible: !model.download_status.is_empty(),
+                    set_visible: model.is_downloading || !model.download_status.is_empty(),
 
                     append = &Separator {
                         set_orientation: Orientation::Horizontal,
@@ -248,6 +224,14 @@ impl SimpleComponent for SystemSetupDialog {
                         set_label: &model.download_status,
                         set_halign: gtk4::Align::Start,
                         set_wrap: true,
+                    },
+
+                    append = &ProgressBar {
+                        #[watch]
+                        set_visible: model.is_downloading,
+                        #[watch]
+                        set_fraction: model.download_progress,
+                        set_show_text: true,
                     },
                 },
 
@@ -286,6 +270,7 @@ impl SimpleComponent for SystemSetupDialog {
             system_check,
             runtime_mgr,
             download_status: String::new(),
+            download_progress: 0.0,
             is_downloading: false,
         };
 
@@ -303,57 +288,62 @@ impl SimpleComponent for SystemSetupDialog {
                 println!("Starting Proton-GE download in background...");
                 self.is_downloading = true;
                 self.download_status = "Fetching latest release information...".to_string();
+                self.download_progress = 0.0;
                 
                 // Clone what we need for the background thread
                 let runtime_mgr = self.runtime_mgr.clone();
                 let sender_clone = sender.clone();
                 
-                // Spawn background thread for download
-                std::thread::spawn(move || {
-                    // Update progress: Fetching release info
-                    let _ = sender_clone.input(SystemSetupMsg::DownloadProgress(
-                        "Fetching latest Proton-GE release...".to_string()
-                    ));
+                // Use glib::MainContext to spawn background work properly
+                glib::MainContext::default().spawn_local(async move {
+                    let sender_for_result = sender_clone.clone();
                     
-                    match runtime_mgr.get_latest_release() {
-                        Ok(release) => {
-                            println!("Found release: {}", release.tag_name);
-                            
-                            // Update progress: Starting download
-                            let _ = sender_clone.input(SystemSetupMsg::DownloadProgress(
-                                format!("Downloading {} (this may take several minutes)...", release.tag_name)
+                    // Run blocking work in thread pool
+                    let result = tokio::task::spawn_blocking(move || {
+                        // Fetch release info
+                        let release = runtime_mgr.get_latest_release()?;
+                        println!("Found release: {}", release.tag_name);
+                        
+                        // Install with progress callbacks
+                        runtime_mgr.install_proton_ge(&release, |status, progress| {
+                            let _ = sender_clone.input(SystemSetupMsg::DownloadProgress {
+                                status,
+                                progress,
+                            });
+                        })
+                    }).await;
+                    
+                    // Handle result
+                    match result {
+                        Ok(Ok(path)) => {
+                            println!("✓ Proton-GE installed successfully to: {:?}", path);
+                            let _ = sender_for_result.input(SystemSetupMsg::DownloadComplete);
+                        }
+                        Ok(Err(e)) => {
+                            eprintln!("✗ Installation failed: {}", e);
+                            let _ = sender_for_result.input(SystemSetupMsg::DownloadError(
+                                format!("Installation failed: {}", e)
                             ));
-                            
-                            match runtime_mgr.install_proton_ge(&release) {
-                                Ok(path) => {
-                                    println!("✓ Proton-GE installed successfully to: {:?}", path);
-                                    let _ = sender_clone.input(SystemSetupMsg::DownloadComplete);
-                                }
-                                Err(e) => {
-                                    eprintln!("✗ Download failed: {}", e);
-                                    let _ = sender_clone.input(SystemSetupMsg::DownloadError(
-                                        format!("Installation failed: {}", e)
-                                    ));
-                                }
-                            }
                         }
                         Err(e) => {
-                            eprintln!("✗ Failed to fetch releases: {}", e);
-                            let _ = sender_clone.input(SystemSetupMsg::DownloadError(
-                                format!("Failed to fetch releases: {}", e)
+                            eprintln!("✗ Thread panic: {:?}", e);
+                            let _ = sender_for_result.input(SystemSetupMsg::DownloadError(
+                                "Internal error occurred".to_string()
                             ));
                         }
                     }
                 });
             }
             
-            SystemSetupMsg::DownloadProgress(status) => {
+            SystemSetupMsg::DownloadProgress { status, progress } => {
                 self.download_status = status;
+                self.download_progress = progress;
             }
             
             SystemSetupMsg::DownloadComplete => {
                 self.is_downloading = false;
                 self.download_status = "✓ Proton-GE installed successfully!".to_string();
+                self.download_progress = 1.0;
                 // Refresh system check
                 self.system_check = SystemCheck::check();
             }
@@ -361,6 +351,7 @@ impl SimpleComponent for SystemSetupDialog {
             SystemSetupMsg::DownloadError(error) => {
                 self.is_downloading = false;
                 self.download_status = format!("✗ Error: {}", error);
+                self.download_progress = 0.0;
             }
             
             SystemSetupMsg::Close => {

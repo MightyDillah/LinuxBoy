@@ -14,7 +14,6 @@ pub struct SystemCheck {
     pub vulkan_installed: bool,
     pub mesa_installed: bool,
     pub proton_installed: bool,
-    pub wine_installed: bool,
     pub missing_apt_packages: Vec<String>,
 }
 
@@ -24,7 +23,6 @@ impl SystemCheck {
         let vulkan_installed = Self::check_command("vulkaninfo");
         let mesa_installed = Self::check_mesa();
         let proton_installed = Self::check_proton_ge();
-        let wine_installed = Self::check_wine();
 
         let mut missing_apt_packages = Vec::new();
         
@@ -45,7 +43,7 @@ impl SystemCheck {
 
         // Determine overall status
         let apt_ok = vulkan_installed && mesa_installed;
-        let runtimes_ok = proton_installed || wine_installed;
+        let runtimes_ok = proton_installed;
 
         let status = if apt_ok && runtimes_ok {
             SystemStatus::AllInstalled
@@ -60,7 +58,6 @@ impl SystemCheck {
             vulkan_installed,
             mesa_installed,
             proton_installed,
-            wine_installed,
             missing_apt_packages,
         }
     }
@@ -111,26 +108,6 @@ impl SystemCheck {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 if name.to_string_lossy().starts_with("proton-ge-") {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    /// Check if Wine is installed (system or in ~/.linuxboy/)
-    fn check_wine() -> bool {
-        // Check system wine first
-        if Self::check_command("wine") || Self::check_command("wine64") {
-            return true;
-        }
-
-        // Check for wine-ge in runtimes
-        let runtimes_dir = Self::get_runtimes_dir();
-        if let Ok(entries) = std::fs::read_dir(&runtimes_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                if name.to_string_lossy().starts_with("wine-ge-") {
                     return true;
                 }
             }

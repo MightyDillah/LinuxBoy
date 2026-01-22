@@ -78,8 +78,11 @@ impl RuntimeManager {
             .find(|asset| asset.name.ends_with(".sha512sum"))
     }
 
-    /// Download a file from URL with progress
-    pub fn download_file(&self, url: &str, dest_path: &Path) -> Result<()> {
+    /// Download a file from URL with progress callback
+    pub fn download_file<F>(&self, url: &str, dest_path: &Path, mut progress_callback: F) -> Result<()>
+    where
+        F: FnMut(u64, u64),  // (downloaded_bytes, total_bytes)
+    {
         println!("Downloading: {}", url);
         println!("Destination: {:?}", dest_path);
 
@@ -87,7 +90,7 @@ impl RuntimeManager {
             .user_agent("LinuxBoy/0.1")
             .build()?;
 
-        let response = client.get(url).send()?;
+        let mut response = client.get(url).send()?;
         
         if !response.status().is_success() {
             anyhow::bail!("Download failed with status: {}", response.status());
@@ -102,10 +105,21 @@ impl RuntimeManager {
         }
 
         let mut file = File::create(dest_path)?;
-        let mut buffer = Vec::new();
-        
-        response.bytes()?.as_ref().read_to_end(&mut buffer)?;
-        file.write_all(&buffer)?;
+        let mut downloaded: u64 = 0;
+        let mut buffer = [0u8; 8192];
+
+        loop {
+            let bytes_read = response.read(&mut buffer)?;
+            if bytes_read == 0 {
+                break;
+            }
+            
+            file.write_all(&buffer[..bytes_read])?;
+            downloaded += bytes_read as u64;
+            
+            // Report progress
+            progress_callback(downloaded, total_size);
+        }
         
         println!("Download complete!");
         Ok(())
@@ -135,8 +149,11 @@ impl RuntimeManager {
         Ok(actual.to_lowercase() == expected_sha256.to_lowercase())
     }
 
-    /// Download and install Proton-GE
-    pub fn install_proton_ge(&self, release: &ProtonRelease) -> Result<PathBuf> {
+    /// Download and install Proton-GE with progress callback
+    pub fn install_proton_ge<F>(&self, release: &ProtonRelease, mut progress_callback: F) -> Result<PathBuf>
+    where
+        F: FnMut(String, f64),  // (status_text, progress_fraction)
+    {
         // Find the tar.gz asset
         let targz_asset = Self::find_targz_asset(release)
             .context("No .tar.gz file found in release")?;
@@ -152,24 +169,40 @@ impl RuntimeManager {
 
         // Download if not already cached
         if !download_path.exists() {
-            println!("Downloading {} ({} MB)...", filename, targz_asset.size / 1_048_576);
-            self.download_file(download_url, &download_path)?;
+            let total_mb = targz_asset.size / 1_048_576;
+            println!("Downloading {} ({} MB)...", filename, total_mb);
+            
+            progress_callback(format!("Downloading {} (0 / {} MB)", filename, total_mb), 0.0);
+            
+            self.download_file(download_url, &download_path, |downloaded, total| {
+                if total > 0 {
+                    let progress = downloaded as f64 / total as f64;
+                    let downloaded_mb = downloaded / 1_048_576;
+                    let total_mb = total / 1_048_576;
+                    progress_callback(
+                        format!("Downloading {} ({} / {} MB)", filename, downloaded_mb, total_mb),
+                        progress * 0.9  // Reserve 10% for extraction
+                    );
+                }
+            })?;
         } else {
             println!("Using cached file: {:?}", download_path);
+            progress_callback(format!("Using cached file: {}", filename), 0.9);
         }
-
-        // TODO: Verify checksum (need to parse .sha512sum file)
-        println!("Checksum verification: Skipped (TODO)");
 
         // Extract to runtimes directory
         fs::create_dir_all(&self.runtimes_dir)?;
         println!("Extracting to {:?}...", self.runtimes_dir);
+        progress_callback("Extracting archive...".to_string(), 0.95);
+        
         self.extract_targz(&download_path, &self.runtimes_dir)?;
 
         // Determine extracted directory name (usually same as tag_name)
         let extracted_dir = self.runtimes_dir.join(&release.tag_name);
         
         println!("Proton-GE installed successfully!");
+        progress_callback("Installation complete!".to_string(), 1.0);
+        
         Ok(extracted_dir)
     }
 
