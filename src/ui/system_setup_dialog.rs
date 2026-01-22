@@ -32,7 +32,7 @@ pub enum SystemSetupOutput {
     SystemCheckUpdated(SystemCheck),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum InstallTarget {
     Vulkan,
     Mesa,
@@ -59,6 +59,8 @@ pub struct SystemSetupDialog {
     proton_installed_version: Option<String>,
     umu_installed_version: Option<String>,
     pending_umu_version: Option<String>,
+    umu_status_markup: String,
+    proton_status_markup: String,
 }
 
 impl SystemSetupDialog {
@@ -208,6 +210,28 @@ impl SystemSetupDialog {
             },
         });
         Ok(())
+    }
+
+    fn update_status_markup(&mut self) {
+        self.umu_status_markup = if self.system_check.umu_installed {
+            if let Some(version) = &self.umu_installed_version {
+                format!("<span foreground='#2ecc71'>✓ Installed ({})</span>", version)
+            } else {
+                "<span foreground='#2ecc71'>✓ Installed</span>".to_string()
+            }
+        } else {
+            "<span foreground='#e74c3c'>✗ Missing</span>".to_string()
+        };
+
+        self.proton_status_markup = if self.system_check.proton_installed {
+            if let Some(version) = &self.proton_installed_version {
+                format!("<span foreground='#2ecc71'>✓ Installed ({})</span>", version)
+            } else {
+                "<span foreground='#2ecc71'>✓ Installed</span>".to_string()
+            }
+        } else {
+            "<span foreground='#f39c12'>✗ Not Downloaded</span>".to_string()
+        };
     }
 
 }
@@ -384,18 +408,7 @@ impl SimpleComponent for SystemSetupDialog {
                     },
                     attach[1, 3, 1, 1] = &Label {
                         #[watch]
-                        set_markup: if model.system_check.umu_installed {
-                            if let Some(version) = &model.umu_installed_version {
-                                format!(
-                                    "<span foreground='#2ecc71'>✓ Installed ({})</span>",
-                                    version
-                                )
-                            } else {
-                                "<span foreground='#2ecc71'>✓ Installed</span>".to_string()
-                            }
-                        } else {
-                            "<span foreground='#e74c3c'>✗ Missing</span>".to_string()
-                        },
+                        set_markup: &model.umu_status_markup,
                         set_halign: gtk4::Align::Start,
                     },
                     attach[2, 3, 1, 1] = &Box {
@@ -428,18 +441,7 @@ impl SimpleComponent for SystemSetupDialog {
                     },
                     attach[1, 4, 1, 1] = &Label {
                         #[watch]
-                        set_markup: if model.system_check.proton_installed {
-                            if let Some(version) = &model.proton_installed_version {
-                                format!(
-                                    "<span foreground='#2ecc71'>✓ Installed ({})</span>",
-                                    version
-                                )
-                            } else {
-                                "<span foreground='#2ecc71'>✓ Installed</span>".to_string()
-                            }
-                        } else {
-                            "<span foreground='#f39c12'>✗ Not Downloaded</span>".to_string()
-                        },
+                        set_markup: &model.proton_status_markup,
                         set_halign: gtk4::Align::Start,
                     },
                     attach[2, 4, 1, 1] = &Box {
@@ -653,7 +655,7 @@ impl SimpleComponent for SystemSetupDialog {
                 versions.last().cloned()
             });
 
-        let model = SystemSetupDialog {
+        let mut model = SystemSetupDialog {
             system_check,
             runtime_mgr,
             download_status: String::new(),
@@ -667,7 +669,11 @@ impl SimpleComponent for SystemSetupDialog {
             proton_installed_version,
             umu_installed_version: None,
             pending_umu_version: None,
+            umu_status_markup: String::new(),
+            proton_status_markup: String::new(),
         };
+
+        model.update_status_markup();
 
         let widgets = view_output!();
         
@@ -788,6 +794,7 @@ impl SimpleComponent for SystemSetupDialog {
                 self.download_status = format!("✓ Proton-GE {} installed successfully!", version);
                 self.download_progress = 1.0;
                 self.proton_installed_version = self.download_version.clone();
+                self.update_status_markup();
                 // Refresh system check
                 self.system_check = SystemCheck::check();
                 let _ = sender.output(SystemSetupOutput::SystemCheckUpdated(
@@ -1095,6 +1102,7 @@ impl SimpleComponent for SystemSetupDialog {
                     self.pending_umu_version = None;
                 }
                 self.system_check = SystemCheck::check();
+                self.update_status_markup();
                 let _ = sender.output(SystemSetupOutput::SystemCheckUpdated(
                     self.system_check.clone(),
                 ));
@@ -1123,6 +1131,7 @@ impl SimpleComponent for SystemSetupDialog {
                 if !self.system_check.umu_installed {
                     self.umu_installed_version = None;
                 }
+                self.update_status_markup();
                 let _ = sender.output(SystemSetupOutput::SystemCheckUpdated(
                     self.system_check.clone(),
                 ));
