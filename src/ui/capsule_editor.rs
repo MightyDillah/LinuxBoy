@@ -1,5 +1,6 @@
 use gtk4::prelude::*;
-use gtk4::{Box, Button, Dialog, Label, ListBox, Orientation, Paned, ResponseType, ScrolledWindow, TreeView};
+use gtk4::{Box, Button, Dialog, Label, ListBox, Orientation, Paned, ResponseType, ScrolledWindow};
+use relm4::RelmWidgetExt;
 use std::path::{Path, PathBuf};
 
 use crate::core::capsule::Capsule;

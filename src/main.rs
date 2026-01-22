@@ -2,9 +2,7 @@ mod core;
 mod ui;
 mod utils;
 
-use gtk4::prelude::*;
-use relm4::{Component, ComponentParts, ComponentSender, RelmApp, SimpleComponent};
-
+use relm4::RelmApp;
 use ui::main_window::MainWindow;
 
 fn main() {

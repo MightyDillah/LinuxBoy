@@ -109,7 +109,6 @@ impl AppImageBuilder {
         
         // Find Program Files and copy game installation
         let program_files = prefix.join("drive_c/Program Files");
-        let program_files_x86 = prefix.join("drive_c/Program Files (x86)");
         
         // TODO: Let user select which folder to package
         // For now, copy first found directory
@@ -172,9 +171,9 @@ impl AppImageBuilder {
         &self,
         main_exe: &str,
         launch_args: &str,
-        shortcuts: Vec<String>,
+        _shortcuts: Vec<String>,
     ) -> CapsuleMetadata {
-        let mut metadata = self.create_metadata(main_exe, launch_args);
+        let metadata = self.create_metadata(main_exe, launch_args);
         // TODO: Parse shortcuts and add as tools
         metadata
     }

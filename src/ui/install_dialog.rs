@@ -1,8 +1,9 @@
 use gtk4::prelude::*;
 use gtk4::{
-    Box, Button, ComboBoxText, Dialog, Entry, FileChooserAction, FileChooserDialog, Label,
+    Box, Button, ComboBoxText, Dialog, Entry, Label,
     ListBox, Orientation, ResponseType, ScrolledWindow,
 };
+use relm4::RelmWidgetExt;
 use std::path::PathBuf;
 
 pub struct InstallDialog {

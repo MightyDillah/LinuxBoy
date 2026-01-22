@@ -2,24 +2,26 @@
 
 Portable gaming manager for Linux. Creates self-contained AppImage capsules for Windows games using Wine/Proton.
 
-## Features
+## Prerequisites (Required to Build)
 
-- Drag-and-drop installer or portable game folder to create AppImage capsules
-- System dependency checker (GPU, Vulkan, Wine, DXVK)
-- Per-capsule Wine/Proton version selection
-- Redistributables installer (Visual C++, .NET, DirectX)
-- Capsule editor for mods and file browsing
-- Backup and restore capsules
+Debian/Ubuntu/Pop!_OS/Linux Mint:
 
-## Requirements
+```bash
+sudo apt update
+sudo apt install -y \
+    build-essential \
+    pkg-config \
+    libgtk-4-dev \
+    libglib2.0-dev \
+    libcairo2-dev \
+    libpango1.0-dev \
+    libgdk-pixbuf-2.0-dev \
+    libgraphene-1.0-dev
+```
 
-- Debian-based Linux distribution (Ubuntu, Pop!_OS, Linux Mint, etc.)
-- Wine or Proton installed
-- Vulkan support (for 3D games)
+## Building from Source
 
-## Installation
-
-Download the latest release or build from source:
+After installing prerequisites:
 
 ```bash
 cargo build --release

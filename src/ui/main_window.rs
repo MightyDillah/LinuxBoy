@@ -1,6 +1,6 @@
 use gtk4::prelude::*;
-use gtk4::{Application, ApplicationWindow, Box, Button, Label, ListBox, Orientation, ScrolledWindow};
-use relm4::{Component, ComponentParts, ComponentSender, SimpleComponent};
+use gtk4::{ApplicationWindow, Box, Button, Label, Orientation, ScrolledWindow};
+use relm4::{ComponentParts, ComponentSender, RelmWidgetExt, SimpleComponent};
 
 use crate::core::capsule::Capsule;
 use std::path::PathBuf;
@@ -99,7 +99,6 @@ impl SimpleComponent for MainWindow {
                             set_margin_all: 20,
                             set_row_spacing: 20,
                             set_column_spacing: 20,
-                        } -> list_box {
                         },
                     },
                 },

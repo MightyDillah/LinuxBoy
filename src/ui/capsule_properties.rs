@@ -2,6 +2,7 @@ use gtk4::prelude::*;
 use gtk4::{
     Box, Button, CheckButton, Dialog, Entry, Grid, Label, Orientation, ResponseType, Switch,
 };
+use relm4::RelmWidgetExt;
 
 use crate::core::capsule::{Capsule, CapsuleMetadata};
 
@@ -128,8 +129,6 @@ impl CapsulePropertiesDialog {
 
     pub fn run(&self) -> Option<CapsuleMetadata> {
         self.dialog.set_visible(true);
-
-        let response = self.dialog.run_future();
 
         // TODO: Extract values from UI and update metadata
 
