@@ -1091,6 +1091,7 @@ dependencies = [
  "chrono",
  "dirs",
  "flate2",
+ "glib",
  "gtk4",
  "hex",
  "indicatif",

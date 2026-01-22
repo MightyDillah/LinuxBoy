@@ -22,6 +22,7 @@ pub struct GitHubAsset {
     pub size: u64,
 }
 
+#[derive(Clone)]
 pub struct RuntimeManager {
     runtimes_dir: PathBuf,
 }
