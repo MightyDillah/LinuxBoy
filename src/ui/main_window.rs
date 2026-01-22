@@ -1,10 +1,10 @@
 use gtk4::prelude::*;
 use gtk4::{ApplicationWindow, Box, Button, Label, Orientation, ScrolledWindow};
-use relm4::{ComponentParts, ComponentSender, RelmWidgetExt, SimpleComponent};
+use relm4::{Component, ComponentParts, ComponentSender, RelmWidgetExt, SimpleComponent};
 
 use crate::core::capsule::Capsule;
 use crate::core::system_checker::{SystemCheck, SystemStatus};
-use crate::core::runtime_manager::RuntimeManager;
+use crate::ui::system_setup_dialog::SystemSetupDialog;
 use std::path::PathBuf;
 
 #[derive(Debug)]
@@ -181,53 +181,15 @@ impl SimpleComponent for MainWindow {
                 // TODO: Implement installer dialog
             }
             MainWindowMsg::OpenSystemSetup => {
-                // Re-check system status
+                // Re-check system status before opening dialog
                 self.system_check = SystemCheck::check();
                 
-                // Print detailed status
-                println!("\n=== System Status ===");
-                for line in self.system_check.detailed_status() {
-                    println!("{}", line);
-                }
+                println!("Opening system setup dialog...");
                 
-                // Show runtime manager info
-                let runtime_mgr = RuntimeManager::new();
-                println!("\n=== Runtime Manager ===");
-                match runtime_mgr.list_installed() {
-                    Ok(installed) => {
-                        if installed.is_empty() {
-                            println!("No Proton-GE versions installed");
-                        } else {
-                            println!("Installed versions:");
-                            for version in installed {
-                                println!("  - {}", version);
-                            }
-                        }
-                    }
-                    Err(e) => println!("Error checking installed versions: {}", e),
-                }
-                
-                // List available releases from GitHub
-                println!("\nFetching available releases from GitHub...");
-                match runtime_mgr.fetch_available_releases() {
-                    Ok(releases) => {
-                        println!("Available Proton-GE releases (showing first 5):");
-                        for release in releases.iter().take(5) {
-                            println!("  - {} ({})", release.tag_name, release.published_at);
-                            if let Some(asset) = RuntimeManager::find_targz_asset(release) {
-                                println!("    File: {} ({} MB)", 
-                                    asset.name, 
-                                    asset.size / 1_048_576);
-                            }
-                        }
-                    }
-                    Err(e) => println!("Error fetching releases: {}", e),
-                }
-                
-                println!("====================\n");
-                
-                // TODO: Open system setup dialog GUI
-                println!("System setup dialog (GUI coming soon)...");
+                // Launch the dialog as a separate component
+                SystemSetupDialog::builder()
+                    .launch(self.system_check.clone())
+                    .detach();
             }
         }
     }

@@ -142,20 +142,4 @@ impl SystemCheck {
         }
     }
 
-    /// Get detailed status for UI display
-    pub fn detailed_status(&self) -> Vec<String> {
-        let mut details = Vec::new();
-        
-        details.push(format!("✓ Vulkan: {}", if self.vulkan_installed { "Installed" } else { "Missing" }));
-        details.push(format!("✓ Mesa Drivers: {}", if self.mesa_installed { "Installed" } else { "Missing" }));
-        details.push(format!("✓ Proton-GE: {}", if self.proton_installed { "Installed" } else { "Not Downloaded" }));
-        details.push(format!("✓ Wine: {}", if self.wine_installed { "Installed" } else { "Not Installed" }));
-
-        if !self.missing_apt_packages.is_empty() {
-            details.push("\nMissing APT packages:".to_string());
-            details.push(format!("  sudo apt install {}", self.missing_apt_packages.join(" ")));
-        }
-
-        details
-    }
 }
