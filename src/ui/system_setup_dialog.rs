@@ -290,48 +290,65 @@ impl SimpleComponent for SystemSetupDialog {
                 self.download_status = "Fetching latest release information...".to_string();
                 self.download_progress = 0.0;
                 
-                // Clone what we need for the background thread
                 let runtime_mgr = self.runtime_mgr.clone();
                 let sender_clone = sender.clone();
                 
-                // Use glib::MainContext to spawn background work properly
-                glib::MainContext::default().spawn_local(async move {
-                    let sender_for_result = sender_clone.clone();
+                // Create a channel for progress updates
+                let (tx, rx) = std::sync::mpsc::channel::<(String, f64)>();
+                
+                // Spawn blocking thread for download
+                std::thread::spawn(move || {
+                    // Fetch release info
+                    match runtime_mgr.get_latest_release() {
+                        Ok(release) => {
+                            println!("Found release: {}", release.tag_name);
+                            
+                            // Install with progress callbacks that send to channel
+                            match runtime_mgr.install_proton_ge(&release, |status, progress| {
+                                let _ = tx.send((status, progress));
+                            }) {
+                                Ok(path) => {
+                                    println!("✓ Proton-GE installed successfully to: {:?}", path);
+                                    let _ = tx.send(("COMPLETE".to_string(), 1.0));
+                                }
+                                Err(e) => {
+                                    eprintln!("✗ Installation failed: {}", e);
+                                    let _ = tx.send((format!("ERROR: {}", e), 0.0));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("✗ Failed to fetch releases: {}", e);
+                            let _ = tx.send((format!("ERROR: Failed to fetch releases: {}", e), 0.0));
+                        }
+                    }
+                });
+                
+                // Poll the channel from GTK main thread
+                glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+                    // Drain all available messages
+                    let mut last_msg = None;
+                    while let Ok(msg) = rx.try_recv() {
+                        last_msg = Some(msg);
+                    }
                     
-                    // Run blocking work in thread pool
-                    let result = tokio::task::spawn_blocking(move || {
-                        // Fetch release info
-                        let release = runtime_mgr.get_latest_release()?;
-                        println!("Found release: {}", release.tag_name);
-                        
-                        // Install with progress callbacks
-                        runtime_mgr.install_proton_ge(&release, |status, progress| {
+                    if let Some((status, progress)) = last_msg {
+                        if status.starts_with("ERROR:") {
+                            let error = status.strip_prefix("ERROR: ").unwrap_or(&status).to_string();
+                            let _ = sender_clone.input(SystemSetupMsg::DownloadError(error));
+                            return glib::ControlFlow::Break;
+                        } else if status == "COMPLETE" {
+                            let _ = sender_clone.input(SystemSetupMsg::DownloadComplete);
+                            return glib::ControlFlow::Break;
+                        } else {
                             let _ = sender_clone.input(SystemSetupMsg::DownloadProgress {
                                 status,
                                 progress,
                             });
-                        })
-                    }).await;
-                    
-                    // Handle result
-                    match result {
-                        Ok(Ok(path)) => {
-                            println!("✓ Proton-GE installed successfully to: {:?}", path);
-                            let _ = sender_for_result.input(SystemSetupMsg::DownloadComplete);
-                        }
-                        Ok(Err(e)) => {
-                            eprintln!("✗ Installation failed: {}", e);
-                            let _ = sender_for_result.input(SystemSetupMsg::DownloadError(
-                                format!("Installation failed: {}", e)
-                            ));
-                        }
-                        Err(e) => {
-                            eprintln!("✗ Thread panic: {:?}", e);
-                            let _ = sender_for_result.input(SystemSetupMsg::DownloadError(
-                                "Internal error occurred".to_string()
-                            ));
                         }
                     }
+                    
+                    glib::ControlFlow::Continue
                 });
             }
             
