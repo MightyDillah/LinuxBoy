@@ -1,0 +1,26 @@
+[package]
+name = "linuxboy"
+version = "0.1.0"
+edition = "2021"
+authors = ["LinuxBoy Contributors"]
+license = "GPL-3.0"
+description = "Portable gaming manager for Linux using Wine and AppImage"
+
+[dependencies]
+gtk4 = "0.9"
+relm4 = "0.9"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+walkdir = "2"
+chrono = "0.4"
+dirs = "5"
+uuid = { version = "1", features = ["v4"] }
+tar = "0.4"
+flate2 = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
