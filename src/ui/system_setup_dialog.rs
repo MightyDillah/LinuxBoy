@@ -170,7 +170,7 @@ impl SimpleComponent for SystemSetupDialog {
 
                         append = &Box {
                             set_orientation: Orientation::Vertical,
-                            set_spacing: 4,
+                            set_spacing: 6,
                             set_hexpand: true,
 
                             append = &Label {
@@ -191,6 +191,7 @@ impl SimpleComponent for SystemSetupDialog {
                             set_orientation: Orientation::Vertical,
                             set_spacing: 6,
                             set_halign: gtk4::Align::End,
+                            set_valign: gtk4::Align::Center,
 
                             append = &Label {
                                 #[watch]
@@ -245,7 +246,7 @@ impl SimpleComponent for SystemSetupDialog {
 
                         append = &Box {
                             set_orientation: Orientation::Vertical,
-                            set_spacing: 4,
+                            set_spacing: 6,
                             set_hexpand: true,
 
                             append = &Label {
@@ -266,6 +267,7 @@ impl SimpleComponent for SystemSetupDialog {
                             set_orientation: Orientation::Vertical,
                             set_spacing: 6,
                             set_halign: gtk4::Align::End,
+                            set_valign: gtk4::Align::Center,
 
                             append = &Label {
                                 #[watch]
@@ -320,7 +322,7 @@ impl SimpleComponent for SystemSetupDialog {
 
                         append = &Box {
                             set_orientation: Orientation::Vertical,
-                            set_spacing: 4,
+                            set_spacing: 6,
                             set_hexpand: true,
 
                             append = &Label {
@@ -341,6 +343,7 @@ impl SimpleComponent for SystemSetupDialog {
                             set_orientation: Orientation::Vertical,
                             set_spacing: 6,
                             set_halign: gtk4::Align::End,
+                            set_valign: gtk4::Align::Center,
 
                             append = &Label {
                                 #[watch]
@@ -391,7 +394,7 @@ impl SimpleComponent for SystemSetupDialog {
 
                         append = &Box {
                             set_orientation: Orientation::Vertical,
-                            set_spacing: 4,
+                            set_spacing: 6,
                             set_hexpand: true,
 
                             append = &Label {
@@ -412,6 +415,7 @@ impl SimpleComponent for SystemSetupDialog {
                             set_orientation: Orientation::Vertical,
                             set_spacing: 6,
                             set_halign: gtk4::Align::End,
+                            set_valign: gtk4::Align::Center,
 
                             append = &Label {
                                 #[watch]
@@ -428,6 +432,7 @@ impl SimpleComponent for SystemSetupDialog {
                             append = &Box {
                                 set_orientation: Orientation::Horizontal,
                                 set_spacing: 8,
+                                set_halign: gtk4::Align::End,
 
                                 append = &Button {
                                     #[watch]

@@ -312,12 +312,17 @@ impl MainWindow {
         }
 
         if self.capsules.is_empty() {
-            let empty = Box::new(Orientation::Vertical, 6);
+            let empty = Box::new(Orientation::Horizontal, 12);
             empty.set_margin_all(8);
             empty.set_css_classes(&["card"]);
 
             let icon = Image::from_icon_name("applications-games-symbolic");
-            icon.set_pixel_size(32);
+            icon.set_pixel_size(28);
+            icon.set_halign(gtk4::Align::Start);
+            icon.set_valign(gtk4::Align::Start);
+
+            let text = Box::new(Orientation::Vertical, 6);
+            text.set_hexpand(true);
 
             let title = Label::new(Some("No games yet"));
             title.set_css_classes(&["card-title"]);
@@ -330,9 +335,11 @@ impl MainWindow {
             subtitle.set_halign(gtk4::Align::Start);
             subtitle.set_wrap(true);
 
+            text.append(&title);
+            text.append(&subtitle);
+
             empty.append(&icon);
-            empty.append(&title);
-            empty.append(&subtitle);
+            empty.append(&text);
             list.append(&empty);
             return;
         }
@@ -348,6 +355,7 @@ impl MainWindow {
 
             let icon = Image::from_icon_name("applications-games-symbolic");
             icon.set_pixel_size(24);
+            icon.set_halign(gtk4::Align::Start);
 
             let name = Label::new(Some(&capsule.name));
             name.set_halign(gtk4::Align::Start);
@@ -388,6 +396,7 @@ impl MainWindow {
             let detail = Label::new(Some(detail_text));
             detail.set_css_classes(&["muted"]);
             detail.set_halign(gtk4::Align::Start);
+            detail.set_margin_top(2);
 
             let actions = Box::new(Orientation::Horizontal, 8);
             actions.set_halign(gtk4::Align::Start);
@@ -496,14 +505,40 @@ impl SimpleComponent for MainWindow {
                     },
 
                     append = &Button {
-                        set_label: "System Setup",
                         set_css_classes: &["secondary"],
+                        #[wrap(Some)]
+                        set_child = &Box {
+                            set_orientation: Orientation::Horizontal,
+                            set_spacing: 6,
+
+                            append = &Image {
+                                set_icon_name: Some("preferences-system-symbolic"),
+                                set_pixel_size: 16,
+                            },
+
+                            append = &Label {
+                                set_label: "System Setup",
+                            },
+                        },
                         connect_clicked => MainWindowMsg::OpenSystemSetup,
                     },
 
                     append = &Button {
-                        set_label: "Add Game",
                         set_css_classes: &["accent"],
+                        #[wrap(Some)]
+                        set_child = &Box {
+                            set_orientation: Orientation::Horizontal,
+                            set_spacing: 6,
+
+                            append = &Image {
+                                set_icon_name: Some("list-add-symbolic"),
+                                set_pixel_size: 16,
+                            },
+
+                            append = &Label {
+                                set_label: "Add Game",
+                            },
+                        },
                         connect_clicked => MainWindowMsg::OpenInstaller,
                     },
                 },
@@ -586,7 +621,7 @@ impl SimpleComponent for MainWindow {
         let system_check = SystemCheck::check();
         println!("System check: {:?}", system_check.status);
 
-        let games_list = Box::new(Orientation::Vertical, 12);
+        let games_list = Box::new(Orientation::Vertical, 16);
         games_list.set_margin_all(12);
         games_list.set_valign(gtk4::Align::Start);
         games_list.set_hexpand(true);
@@ -672,19 +707,8 @@ impl SimpleComponent for MainWindow {
         status_box.append(&system_status_label);
         status_box.append(&system_status_detail);
 
-        let system_actions = Box::new(Orientation::Horizontal, 8);
-        system_actions.set_halign(gtk4::Align::End);
-
-        let setup_button = Button::with_label("Open System Setup");
-        setup_button.add_css_class("accent");
-        let setup_sender = sender.clone();
-        setup_button.connect_clicked(move |_| {
-            setup_sender.input(MainWindowMsg::OpenSystemSetup);
-        });
-        system_actions.append(&setup_button);
-
         system_card.append(&status_box);
-        system_card.append(&system_actions);
+        system_card.append(&Box::new(Orientation::Horizontal, 0));
 
         system_page.append(&system_header);
         system_page.append(&system_card);
