@@ -1,7 +1,9 @@
 use gtk4::prelude::*;
-use gtk4::{Dialog, Box, Label, Button, Orientation, Grid, Separator, Frame, ProgressBar};
-use gtk4::gdk;
+use gtk4::{Dialog, Box, Label, Button, Orientation, Grid, Separator, Frame, ProgressBar, ScrolledWindow};
 use relm4::{ComponentParts, ComponentSender, RelmWidgetExt, SimpleComponent};
+use serde::Deserialize;
+use std::io::{BufRead, BufReader};
+use std::process::{Command, Stdio};
 
 use crate::core::system_checker::SystemCheck;
 use crate::core::runtime_manager::RuntimeManager;
@@ -13,7 +15,10 @@ pub enum SystemSetupMsg {
     DownloadVersion(String),
     DownloadComplete,
     DownloadError(String),
-    CopyCommand(CommandKind),
+    RunAptInstall { target: InstallTarget, reinstall: bool },
+    RunUmuInstall { reinstall: bool },
+    InstallLog(String),
+    InstallFinished { success: bool, message: String },
     RefreshStatus,
     Refresh(SystemCheck),
     Close,
@@ -26,13 +31,10 @@ pub enum SystemSetupOutput {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum CommandKind {
-    VulkanInstall,
-    VulkanReinstall,
-    MesaInstall,
-    MesaReinstall,
+pub enum InstallTarget {
+    Vulkan,
+    Mesa,
     MissingPackages,
-    UmuDocs,
 }
 
 pub struct SystemSetupDialog {
@@ -42,9 +44,15 @@ pub struct SystemSetupDialog {
     download_progress: f64,  // 0.0 to 1.0
     download_version: Option<String>,
     is_downloading: bool,
+    install_status: String,
+    install_log: String,
+    install_running: bool,
 }
 
 impl SystemSetupDialog {
+    const UMU_RELEASE_API: &'static str =
+        "https://api.github.com/repos/Open-Wine-Components/umu-launcher/releases/latest";
+
     fn vulkan_packages() -> [&'static str; 3] {
         ["vulkan-tools", "libvulkan1", "libvulkan1:i386"]
     }
@@ -60,41 +68,138 @@ impl SystemSetupDialog {
         ]
     }
 
-    fn apt_command(packages: &[&str], reinstall: bool) -> String {
-        if reinstall {
-            format!("sudo apt install --reinstall {}", packages.join(" "))
-        } else {
-            format!("sudo apt install {}", packages.join(" "))
-        }
-    }
-
-    fn command_for(&self, kind: CommandKind) -> Option<String> {
-        match kind {
-            CommandKind::VulkanInstall => Some(Self::apt_command(&Self::vulkan_packages(), false)),
-            CommandKind::VulkanReinstall => Some(Self::apt_command(&Self::vulkan_packages(), true)),
-            CommandKind::MesaInstall => Some(Self::apt_command(&Self::mesa_packages(), false)),
-            CommandKind::MesaReinstall => Some(Self::apt_command(&Self::mesa_packages(), true)),
-            CommandKind::MissingPackages => {
-                if self.system_check.missing_apt_packages.is_empty() {
-                    None
-                } else {
-                    Some(format!(
-                        "sudo apt install {}",
-                        self.system_check.missing_apt_packages.join(" ")
-                    ))
-                }
+    fn parse_os_release() -> Option<std::collections::HashMap<String, String>> {
+        let contents = std::fs::read_to_string("/etc/os-release").ok()?;
+        let mut map = std::collections::HashMap::new();
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
             }
-            CommandKind::UmuDocs => Some(
-                "https://github.com/Open-Wine-Components/umu-launcher".to_string(),
-            ),
+            if let Some((key, value)) = line.split_once('=') {
+                let cleaned = value.trim().trim_matches('"').to_string();
+                map.insert(key.to_string(), cleaned);
+            }
+        }
+        Some(map)
+    }
+
+    fn deb_arch() -> Option<&'static str> {
+        match std::env::consts::ARCH {
+            "x86_64" => Some("amd64"),
+            "aarch64" => Some("arm64"),
+            "arm" => Some("armhf"),
+            _ => None,
         }
     }
 
-    fn copy_to_clipboard(text: &str) {
-        if let Some(display) = gdk::Display::default() {
-            display.clipboard().set_text(text);
+    fn select_umu_asset(assets: &[UmuAsset], debian_version: &str, arch: &str) -> Option<UmuAsset> {
+        let exact = assets.iter().find(|asset| {
+            asset.name.ends_with(".deb")
+                && asset.name.contains("python3-umu-launcher")
+                && asset.name.contains(&format!("_{}_debian-{}", arch, debian_version))
+        });
+        if let Some(asset) = exact {
+            return Some(asset.clone());
         }
+
+        let fallback = assets.iter().find(|asset| {
+            asset.name.ends_with(".deb")
+                && asset.name.contains("umu-launcher")
+                && asset.name.contains(&format!("_all_debian-{}", debian_version))
+        });
+        fallback.cloned()
     }
+
+    fn fetch_latest_umu_release() -> Result<UmuRelease, String> {
+        let client = reqwest::blocking::Client::builder()
+            .user_agent("LinuxBoy/0.1")
+            .build()
+            .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+        let response = client
+            .get(Self::UMU_RELEASE_API)
+            .send()
+            .map_err(|e| format!("Failed to fetch UMU release: {}", e))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "UMU release fetch failed: HTTP {}",
+                response.status()
+            ));
+        }
+        response
+            .json::<UmuRelease>()
+            .map_err(|e| format!("Failed to parse UMU release JSON: {}", e))
+    }
+
+    fn spawn_command_with_logs(
+        mut cmd: Command,
+        tx: std::sync::mpsc::Sender<InstallUpdate>,
+    ) -> Result<(), String> {
+        let mut child = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to launch installer: {}", e))?;
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "Failed to capture stdout".to_string())?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "Failed to capture stderr".to_string())?;
+
+        let tx_out = tx.clone();
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().flatten() {
+                let _ = tx_out.send(InstallUpdate::Log(line));
+            }
+        });
+
+        let tx_err = tx.clone();
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines().flatten() {
+                let _ = tx_err.send(InstallUpdate::Log(line));
+            }
+        });
+
+        let status = child
+            .wait()
+            .map_err(|e| format!("Install process failed: {}", e))?;
+        let success = status.success();
+        let _ = tx.send(InstallUpdate::Finished {
+            success,
+            message: if success {
+                "Install completed successfully.".to_string()
+            } else {
+                format!("Install failed with status: {}", status)
+            },
+        });
+        Ok(())
+    }
+
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct UmuRelease {
+    pub tag_name: String,
+    pub assets: Vec<UmuAsset>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct UmuAsset {
+    pub name: String,
+    pub browser_download_url: String,
+    pub size: u64,
+}
+
+#[derive(Debug)]
+enum InstallUpdate {
+    Log(String),
+    Finished { success: bool, message: String },
 }
 
 #[relm4::component(pub)]
@@ -177,15 +282,25 @@ impl SimpleComponent for SystemSetupDialog {
                         append = &Button {
                             #[watch]
                             set_visible: !model.system_check.vulkan_installed,
-                            set_label: "Copy install cmd",
-                            connect_clicked => SystemSetupMsg::CopyCommand(CommandKind::VulkanInstall),
+                            set_label: "Install",
+                            #[watch]
+                            set_sensitive: !model.install_running,
+                            connect_clicked => SystemSetupMsg::RunAptInstall {
+                                target: InstallTarget::Vulkan,
+                                reinstall: false,
+                            },
                         },
 
                         append = &Button {
                             #[watch]
                             set_visible: model.system_check.vulkan_installed,
-                            set_label: "Copy reinstall cmd",
-                            connect_clicked => SystemSetupMsg::CopyCommand(CommandKind::VulkanReinstall),
+                            set_label: "Reinstall",
+                            #[watch]
+                            set_sensitive: !model.install_running,
+                            connect_clicked => SystemSetupMsg::RunAptInstall {
+                                target: InstallTarget::Vulkan,
+                                reinstall: true,
+                            },
                         },
                     },
 
@@ -210,15 +325,25 @@ impl SimpleComponent for SystemSetupDialog {
                         append = &Button {
                             #[watch]
                             set_visible: !model.system_check.mesa_installed,
-                            set_label: "Copy install cmd",
-                            connect_clicked => SystemSetupMsg::CopyCommand(CommandKind::MesaInstall),
+                            set_label: "Install",
+                            #[watch]
+                            set_sensitive: !model.install_running,
+                            connect_clicked => SystemSetupMsg::RunAptInstall {
+                                target: InstallTarget::Mesa,
+                                reinstall: false,
+                            },
                         },
 
                         append = &Button {
                             #[watch]
                             set_visible: model.system_check.mesa_installed,
-                            set_label: "Copy reinstall cmd",
-                            connect_clicked => SystemSetupMsg::CopyCommand(CommandKind::MesaReinstall),
+                            set_label: "Reinstall",
+                            #[watch]
+                            set_sensitive: !model.install_running,
+                            connect_clicked => SystemSetupMsg::RunAptInstall {
+                                target: InstallTarget::Mesa,
+                                reinstall: true,
+                            },
                         },
                     },
 
@@ -243,8 +368,19 @@ impl SimpleComponent for SystemSetupDialog {
                         append = &Button {
                             #[watch]
                             set_visible: !model.system_check.umu_installed,
-                            set_label: "Copy install docs",
-                            connect_clicked => SystemSetupMsg::CopyCommand(CommandKind::UmuDocs),
+                            set_label: "Install",
+                            #[watch]
+                            set_sensitive: !model.install_running,
+                            connect_clicked => SystemSetupMsg::RunUmuInstall { reinstall: false },
+                        },
+
+                        append = &Button {
+                            #[watch]
+                            set_visible: model.system_check.umu_installed,
+                            set_label: "Reinstall",
+                            #[watch]
+                            set_sensitive: !model.install_running,
+                            connect_clicked => SystemSetupMsg::RunUmuInstall { reinstall: true },
                         },
                     },
 
@@ -314,15 +450,9 @@ impl SimpleComponent for SystemSetupDialog {
                     },
 
                     append = &Label {
-                        set_label: "Install the following packages to enable Vulkan support:",
+                        set_label: "Install the following packages to enable graphics support:",
                         set_halign: gtk4::Align::Start,
                         set_wrap: true,
-                    },
-
-                    append = &Button {
-                        set_halign: gtk4::Align::Start,
-                        set_label: "Copy install command",
-                        connect_clicked => SystemSetupMsg::CopyCommand(CommandKind::MissingPackages),
                     },
 
                     append = &Frame {
@@ -334,13 +464,22 @@ impl SimpleComponent for SystemSetupDialog {
 
                             append = &Label {
                                 #[watch]
-                                set_markup: &format!("<tt>sudo apt install {}</tt>", 
-                                    model.system_check.missing_apt_packages.join(" ")
-                                ),
+                                set_label: &model.system_check.missing_apt_packages.join(" "),
                                 set_halign: gtk4::Align::Start,
                                 set_selectable: true,
                                 set_wrap: true,
                             },
+                        },
+                    },
+
+                    append = &Button {
+                        set_halign: gtk4::Align::Start,
+                        set_label: "Install missing packages",
+                        #[watch]
+                        set_sensitive: !model.install_running,
+                        connect_clicked => SystemSetupMsg::RunAptInstall {
+                            target: InstallTarget::MissingPackages,
+                            reinstall: false,
                         },
                     },
                 },
@@ -390,6 +529,43 @@ impl SimpleComponent for SystemSetupDialog {
                     },
                 },
 
+                // Install output area
+                append = &Box {
+                    set_orientation: Orientation::Vertical,
+                    set_spacing: 10,
+                    set_margin_top: 10,
+                    #[watch]
+                    set_visible: model.install_running || !model.install_log.is_empty(),
+
+                    append = &Separator {
+                        set_orientation: Orientation::Horizontal,
+                    },
+
+                    append = &Label {
+                        set_markup: "<b>Install Output</b>",
+                        set_halign: gtk4::Align::Start,
+                    },
+
+                    append = &Label {
+                        #[watch]
+                        set_label: &model.install_status,
+                        set_halign: gtk4::Align::Start,
+                        set_wrap: true,
+                    },
+
+                    append = &ScrolledWindow {
+                        set_min_content_height: 160,
+                        #[wrap(Some)]
+                        set_child = &Label {
+                            #[watch]
+                            set_label: &model.install_log,
+                            set_halign: gtk4::Align::Start,
+                            set_selectable: true,
+                            set_wrap: true,
+                        },
+                    },
+                },
+
                 // Spacer
                 append = &Box {
                     set_vexpand: true,
@@ -433,6 +609,9 @@ impl SimpleComponent for SystemSetupDialog {
             download_progress: 0.0,
             download_version: None,
             is_downloading: false,
+            install_status: String::new(),
+            install_log: String::new(),
+            install_running: false,
         };
 
         let widgets = view_output!();
@@ -566,13 +745,245 @@ impl SimpleComponent for SystemSetupDialog {
                 self.download_progress = 0.0;
             }
 
-            SystemSetupMsg::CopyCommand(kind) => {
-                if let Some(command) = self.command_for(kind) {
-                    Self::copy_to_clipboard(&command);
-                    println!("Copied to clipboard: {}", command);
-                } else {
-                    println!("No command available to copy");
+            SystemSetupMsg::RunAptInstall { target, reinstall } => {
+                if self.install_running {
+                    return;
                 }
+
+                let packages: Vec<String> = match target {
+                    InstallTarget::Vulkan => Self::vulkan_packages().iter().map(|s| s.to_string()).collect(),
+                    InstallTarget::Mesa => Self::mesa_packages().iter().map(|s| s.to_string()).collect(),
+                    InstallTarget::MissingPackages => {
+                        if self.system_check.missing_apt_packages.is_empty() {
+                            self.install_status = "No missing packages to install.".to_string();
+                            return;
+                        }
+                        self.system_check.missing_apt_packages.clone()
+                    }
+                };
+
+                self.install_running = true;
+                self.install_log.clear();
+                self.install_status = match target {
+                    InstallTarget::Vulkan => "Installing Vulkan packages...".to_string(),
+                    InstallTarget::Mesa => "Installing Mesa packages...".to_string(),
+                    InstallTarget::MissingPackages => "Installing missing packages...".to_string(),
+                };
+
+                let sender_clone = sender.clone();
+                let (tx, rx) = std::sync::mpsc::channel::<InstallUpdate>();
+
+                std::thread::spawn(move || {
+                    let mut cmd = Command::new("pkexec");
+                    cmd.arg("env")
+                        .arg("DEBIAN_FRONTEND=noninteractive")
+                        .arg("apt")
+                        .arg("install")
+                        .arg("-y");
+                    if reinstall {
+                        cmd.arg("--reinstall");
+                    }
+                    for pkg in packages {
+                        cmd.arg(pkg);
+                    }
+
+                    if let Err(err) = Self::spawn_command_with_logs(cmd, tx.clone()) {
+                        let _ = tx.send(InstallUpdate::Finished {
+                            success: false,
+                            message: err,
+                        });
+                    }
+                });
+
+                glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+                    let mut finished = None;
+                    while let Ok(update) = rx.try_recv() {
+                        match update {
+                            InstallUpdate::Log(line) => {
+                                let _ = sender_clone.input(SystemSetupMsg::InstallLog(line));
+                            }
+                            InstallUpdate::Finished { success, message } => {
+                                finished = Some((success, message));
+                            }
+                        }
+                    }
+
+                    if let Some((success, message)) = finished {
+                        let _ = sender_clone.input(SystemSetupMsg::InstallFinished {
+                            success,
+                            message,
+                        });
+                        return glib::ControlFlow::Break;
+                    }
+
+                    glib::ControlFlow::Continue
+                });
+            }
+
+            SystemSetupMsg::RunUmuInstall { reinstall } => {
+                if self.install_running {
+                    return;
+                }
+
+                self.install_running = true;
+                self.install_log.clear();
+                self.install_status = if reinstall {
+                    "Reinstalling UMU Launcher...".to_string()
+                } else {
+                    "Installing UMU Launcher...".to_string()
+                };
+
+                let runtime_mgr = self.runtime_mgr.clone();
+                let sender_clone = sender.clone();
+                let (tx, rx) = std::sync::mpsc::channel::<InstallUpdate>();
+
+                std::thread::spawn(move || {
+                    let os_release = Self::parse_os_release()
+                        .ok_or_else(|| "Unable to read /etc/os-release".to_string());
+                    let arch = Self::deb_arch()
+                        .ok_or_else(|| "Unsupported CPU architecture".to_string());
+
+                    let result: Result<(), String> = (|| {
+                        let os_release = os_release?;
+                        let distro_id = os_release
+                            .get("ID")
+                            .cloned()
+                            .unwrap_or_else(|| "unknown".to_string());
+                        let version_id = os_release
+                            .get("VERSION_ID")
+                            .cloned()
+                            .unwrap_or_else(|| "unknown".to_string());
+
+                        if distro_id != "debian" {
+                            return Err(format!(
+                                "Unsupported distro for .deb install: {}",
+                                distro_id
+                            ));
+                        }
+
+                        let arch = arch?;
+                        let _ = tx.send(InstallUpdate::Log(format!(
+                            "Detected distro: debian {} ({})",
+                            version_id, arch
+                        )));
+
+                        let release = Self::fetch_latest_umu_release()?;
+                        let _ = tx.send(InstallUpdate::Log(format!(
+                            "Latest release: {}",
+                            release.tag_name
+                        )));
+                        let asset = Self::select_umu_asset(&release.assets, &version_id, arch)
+                            .ok_or_else(|| "No matching .deb asset found for this distro/arch".to_string())?;
+
+                        let _ = tx.send(InstallUpdate::Log(format!(
+                            "Selected asset: {}",
+                            asset.name
+                        )));
+
+                        let download_dir = std::env::temp_dir()
+                            .join("linuxboy")
+                            .join("downloads");
+                        std::fs::create_dir_all(&download_dir)
+                            .map_err(|e| format!("Failed to create download dir: {}", e))?;
+                        let dest_path = download_dir.join(&asset.name);
+
+                        let mut last_percent = 0u64;
+                        runtime_mgr
+                            .download_file(
+                                &asset.browser_download_url,
+                                &dest_path,
+                                Some(asset.size),
+                                |downloaded, total| {
+                                    if total > 0 {
+                                        let percent = (downloaded.saturating_mul(100)) / total;
+                                        if percent >= last_percent + 5 || percent == 100 {
+                                            last_percent = percent;
+                                            let _ = tx.send(InstallUpdate::Log(format!(
+                                                "Download {}% ({}/{})",
+                                                percent, downloaded, total
+                                            )));
+                                        }
+                                    }
+                                },
+                            )
+                            .map_err(|e| format!("Download failed: {}", e))?;
+
+                        let _ = tx.send(InstallUpdate::Log(
+                            "Download complete. Installing package...".to_string(),
+                        ));
+
+                        let mut cmd = Command::new("pkexec");
+                        cmd.arg("env")
+                            .arg("DEBIAN_FRONTEND=noninteractive")
+                            .arg("apt")
+                            .arg("install")
+                            .arg("-y");
+                        if reinstall {
+                            cmd.arg("--reinstall");
+                        }
+                        cmd.arg(dest_path);
+
+                        Self::spawn_command_with_logs(cmd, tx.clone())?;
+                        Ok(())
+                    })();
+
+                    if let Err(err) = result {
+                        let _ = tx.send(InstallUpdate::Finished {
+                            success: false,
+                            message: err,
+                        });
+                    }
+                });
+
+                glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+                    let mut finished = None;
+                    while let Ok(update) = rx.try_recv() {
+                        match update {
+                            InstallUpdate::Log(line) => {
+                                let _ = sender_clone.input(SystemSetupMsg::InstallLog(line));
+                            }
+                            InstallUpdate::Finished { success, message } => {
+                                finished = Some((success, message));
+                            }
+                        }
+                    }
+
+                    if let Some((success, message)) = finished {
+                        let _ = sender_clone.input(SystemSetupMsg::InstallFinished {
+                            success,
+                            message,
+                        });
+                        return glib::ControlFlow::Break;
+                    }
+
+                    glib::ControlFlow::Continue
+                });
+            }
+
+            SystemSetupMsg::InstallLog(line) => {
+                if !self.install_log.is_empty() {
+                    self.install_log.push('\n');
+                }
+                self.install_log.push_str(&line);
+            }
+
+            SystemSetupMsg::InstallFinished { success, message } => {
+                self.install_running = false;
+                self.install_status = if success {
+                    "Install completed.".to_string()
+                } else {
+                    "Install failed.".to_string()
+                };
+                if !message.is_empty() {
+                    if !self.install_log.is_empty() {
+                        self.install_log.push('\n');
+                    }
+                    self.install_log.push_str(&message);
+                }
+                self.system_check = SystemCheck::check();
+                let _ = sender.output(SystemSetupOutput::SystemCheckUpdated(
+                    self.system_check.clone(),
+                ));
             }
 
             SystemSetupMsg::RefreshStatus => {
