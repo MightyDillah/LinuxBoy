@@ -117,43 +117,6 @@ impl Capsule {
         home.set_file_name(format!("{}.home", name));
         home
     }
-
-    /// Save metadata to disk
-    pub fn save_metadata(&self) -> Result<()> {
-        if !self.home_path.exists() {
-            fs::create_dir_all(&self.home_path)?;
-        }
-
-        let metadata_path = self.home_path.join("metadata.json");
-        let content = serde_json::to_string_pretty(&self.metadata)?;
-        fs::write(&metadata_path, content)?;
-
-        Ok(())
-    }
-
-    /// Launch the capsule
-    pub fn launch(&self) -> Result<()> {
-        if !self.appimage_path.exists() {
-            anyhow::bail!("AppImage not found: {:?}", self.appimage_path);
-        }
-
-        // TODO: Implement launch logic
-        println!("Launching: {}", self.name);
-        Ok(())
-    }
-
-    /// Remove the capsule (delete AppImage and .home directory)
-    pub fn remove(&self) -> Result<()> {
-        if self.appimage_path.exists() {
-            fs::remove_file(&self.appimage_path)?;
-        }
-
-        if self.home_path.exists() {
-            fs::remove_dir_all(&self.home_path)?;
-        }
-
-        Ok(())
-    }
 }
 
 impl Default for CapsuleMetadata {

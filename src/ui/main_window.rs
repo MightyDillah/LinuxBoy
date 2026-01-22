@@ -8,9 +8,7 @@ use std::path::PathBuf;
 #[derive(Debug)]
 pub enum MainWindowMsg {
     LoadCapsules,
-    LaunchCapsule(usize),
     OpenInstaller,
-    Quit,
 }
 
 pub struct MainWindow {
@@ -26,7 +24,7 @@ impl SimpleComponent for MainWindow {
 
     view! {
         #[root]
-        window = ApplicationWindow {
+        ApplicationWindow {
             set_title: Some("LinuxBoy"),
             set_default_width: 1000,
             set_default_height: 700,
@@ -153,19 +151,9 @@ impl SimpleComponent for MainWindow {
                     }
                 }
             }
-            MainWindowMsg::LaunchCapsule(index) => {
-                if let Some(capsule) = self.capsules.get(index) {
-                    if let Err(e) = capsule.launch() {
-                        eprintln!("Failed to launch {}: {}", capsule.name, e);
-                    }
-                }
-            }
             MainWindowMsg::OpenInstaller => {
                 println!("Open installer dialog");
                 // TODO: Implement installer dialog
-            }
-            MainWindowMsg::Quit => {
-                std::process::exit(0);
             }
         }
     }
