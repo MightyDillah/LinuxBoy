@@ -1,8 +1,7 @@
 use gtk4::prelude::*;
 use gtk4::{
     ApplicationWindow, Box, Button, Dialog, Entry, FileChooserAction, FileChooserNative,
-    FileFilter, Image, Label, Orientation, ResponseType, ScrolledWindow, Stack, StackSwitcher,
-    StackTransitionType,
+    FileFilter, Image, Label, Orientation, ResponseType, ScrolledWindow,
 };
 use relm4::{Component, ComponentParts, ComponentSender, RelmWidgetExt, SimpleComponent};
 use relm4::component::{ComponentController, Controller};
@@ -54,8 +53,6 @@ pub struct MainWindow {
     active_installs: HashMap<PathBuf, i32>,
     games_list: Box,
     library_count_label: Label,
-    system_status_label: Label,
-    system_status_detail: Label,
     root_window: ApplicationWindow,
 }
 
@@ -63,20 +60,6 @@ impl MainWindow {
     fn update_library_labels(&self) {
         self.library_count_label
             .set_label(&format!("{} games", self.capsules.len()));
-    }
-
-    fn update_system_labels(&self) {
-        let (title, class) = match self.system_check.status {
-            SystemStatus::AllInstalled => ("System Ready", "status-ready"),
-            SystemStatus::PartiallyInstalled => ("Setup Incomplete", "status-warning"),
-            SystemStatus::NothingInstalled => ("Setup Required", "status-missing"),
-        };
-
-        self.system_status_label.set_label(title);
-        self.system_status_label
-            .set_css_classes(&["status-label", class]);
-        self.system_status_detail
-            .set_label(&self.system_check.status_message());
     }
 
     fn sanitize_name(name: &str) -> String {
@@ -485,42 +468,17 @@ impl SimpleComponent for MainWindow {
 
                     append = &Box {
                         set_orientation: Orientation::Vertical,
-                        set_spacing: 2,
+                        set_spacing: 0,
 
                         append = &Label {
                             set_label: "LinuxBoy",
                             set_css_classes: &["app-title"],
                             set_halign: gtk4::Align::Start,
                         },
-
-                        append = &Label {
-                            set_label: "Portable game manager for Proton-GE",
-                            set_css_classes: &["muted"],
-                            set_halign: gtk4::Align::Start,
-                        },
                     },
 
                     append = &Box {
                         set_hexpand: true,
-                    },
-
-                    append = &Button {
-                        set_css_classes: &["secondary"],
-                        #[wrap(Some)]
-                        set_child = &Box {
-                            set_orientation: Orientation::Horizontal,
-                            set_spacing: 6,
-
-                            append = &Image {
-                                set_icon_name: Some("preferences-system-symbolic"),
-                                set_pixel_size: 16,
-                            },
-
-                            append = &Label {
-                                set_label: "System Setup",
-                            },
-                        },
-                        connect_clicked => MainWindowMsg::OpenSystemSetup,
                     },
 
                     append = &Button {
@@ -543,19 +501,6 @@ impl SimpleComponent for MainWindow {
                     },
                 },
 
-                // Tabs
-                append = &Box {
-                    set_orientation: Orientation::Horizontal,
-                    set_margin_start: 20,
-                    set_margin_end: 20,
-                    set_margin_bottom: 8,
-
-                    append = &StackSwitcher {
-                        set_stack: Some(&main_stack),
-                        set_css_classes: &["tab-switcher"],
-                    },
-                },
-
                 // Main content area
                 append = &Box {
                     set_orientation: Orientation::Vertical,
@@ -565,7 +510,7 @@ impl SimpleComponent for MainWindow {
                     set_margin_end: 12,
 
                     #[local_ref]
-                    main_stack -> Stack {},
+                    library_page -> Box {},
                 },
 
                 // Status bar
@@ -574,8 +519,8 @@ impl SimpleComponent for MainWindow {
                     set_spacing: 12,
                     set_margin_start: 20,
                     set_margin_end: 20,
-                    set_margin_top: 8,
-                    set_margin_bottom: 16,
+                    set_margin_top: 18,
+                    set_margin_bottom: 20,
                     set_css_classes: &["status-bar"],
 
                     append = &Label {
@@ -588,7 +533,7 @@ impl SimpleComponent for MainWindow {
                         set_hexpand: true,
                     },
 
-                    append = &Label {
+                    append = &Button {
                         #[watch]
                         set_label: &match model.system_check.status {
                             SystemStatus::AllInstalled => "System Ready",
@@ -601,7 +546,10 @@ impl SimpleComponent for MainWindow {
                             SystemStatus::PartiallyInstalled => ["pill", "pill-warning"],
                             SystemStatus::NothingInstalled => ["pill", "pill-missing"],
                         },
+                        #[watch]
+                        set_tooltip_text: Some(&model.system_check.status_message()),
                         set_halign: gtk4::Align::End,
+                        connect_clicked => MainWindowMsg::OpenSystemSetup,
                     },
                 },
             },
@@ -622,26 +570,13 @@ impl SimpleComponent for MainWindow {
         println!("System check: {:?}", system_check.status);
 
         let games_list = Box::new(Orientation::Vertical, 16);
-        games_list.set_margin_all(12);
+        games_list.set_margin_all(0);
         games_list.set_valign(gtk4::Align::Start);
         games_list.set_hexpand(true);
 
         let library_count_label = Label::new(None);
         library_count_label.set_css_classes(&["muted"]);
         library_count_label.set_halign(gtk4::Align::Start);
-
-        let system_status_label = Label::new(None);
-        system_status_label.set_halign(gtk4::Align::Start);
-
-        let system_status_detail = Label::new(None);
-        system_status_detail.set_css_classes(&["muted"]);
-        system_status_detail.set_halign(gtk4::Align::Start);
-        system_status_detail.set_wrap(true);
-
-        let main_stack = Stack::new();
-        main_stack.set_hexpand(true);
-        main_stack.set_vexpand(true);
-        main_stack.set_transition_type(StackTransitionType::SlideLeftRight);
 
         let library_page = Box::new(Orientation::Vertical, 16);
         library_page.set_margin_all(20);
@@ -666,55 +601,20 @@ impl SimpleComponent for MainWindow {
         library_header.append(&library_spacer);
         library_header.append(&library_count_label);
 
-        let library_card = Box::new(Orientation::Vertical, 0);
-        library_card.set_css_classes(&["card"]);
-        library_card.set_hexpand(true);
-        library_card.set_vexpand(true);
+        let library_body = Box::new(Orientation::Vertical, 0);
+        library_body.set_halign(gtk4::Align::Center);
+        library_body.set_hexpand(true);
+        library_body.set_vexpand(true);
+        library_body.set_width_request(900);
 
         let games_scroller = ScrolledWindow::new();
         games_scroller.set_hexpand(true);
         games_scroller.set_vexpand(true);
         games_scroller.set_child(Some(&games_list));
-        library_card.append(&games_scroller);
+        library_body.append(&games_scroller);
 
         library_page.append(&library_header);
-        library_page.append(&library_card);
-
-        let system_page = Box::new(Orientation::Vertical, 16);
-        system_page.set_margin_all(20);
-        system_page.set_hexpand(true);
-        system_page.set_vexpand(true);
-
-        let system_header = Box::new(Orientation::Horizontal, 12);
-        system_header.set_hexpand(true);
-
-        let system_icon = Image::from_icon_name("preferences-system-symbolic");
-        system_icon.set_pixel_size(24);
-
-        let system_title = Label::new(Some("System"));
-        system_title.set_css_classes(&["section-title"]);
-        system_title.set_halign(gtk4::Align::Start);
-
-        system_header.append(&system_icon);
-        system_header.append(&system_title);
-
-        let system_card = Box::new(Orientation::Horizontal, 16);
-        system_card.set_css_classes(&["card"]);
-        system_card.set_hexpand(true);
-
-        let status_box = Box::new(Orientation::Vertical, 6);
-        status_box.set_hexpand(true);
-        status_box.append(&system_status_label);
-        status_box.append(&system_status_detail);
-
-        system_card.append(&status_box);
-        system_card.append(&Box::new(Orientation::Horizontal, 0));
-
-        system_page.append(&system_header);
-        system_page.append(&system_card);
-
-        main_stack.add_titled(&library_page, Some("library"), "Library");
-        main_stack.add_titled(&system_page, Some("system"), "System");
+        library_page.append(&library_body);
 
         let model = MainWindow {
             capsules: Vec::new(),
@@ -728,13 +628,10 @@ impl SimpleComponent for MainWindow {
             active_installs: HashMap::new(),
             games_list: games_list.clone(),
             library_count_label,
-            system_status_label,
-            system_status_detail,
             root_window: root.clone(),
         };
 
         model.update_library_labels();
-        model.update_system_labels();
 
         let widgets = view_output!();
 
@@ -884,7 +781,6 @@ impl SimpleComponent for MainWindow {
             MainWindowMsg::OpenSystemSetup => {
                 // Re-check system status before opening dialog
                 self.system_check = SystemCheck::check();
-                self.update_system_labels();
                 
                 println!("Opening system setup dialog...");
                 
@@ -906,7 +802,6 @@ impl SimpleComponent for MainWindow {
             }
             MainWindowMsg::SystemSetupOutput(SystemSetupOutput::SystemCheckUpdated(system_check)) => {
                 self.system_check = system_check;
-                self.update_system_labels();
             }
         }
     }

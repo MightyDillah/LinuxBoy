@@ -69,6 +69,7 @@
 
 .topbar {
   border-bottom: 1px solid alpha(@theme_fg_color, 0.08);
+  padding-bottom: 8px;
 }
 
 .tab-switcher button {
@@ -82,6 +83,7 @@
 
 .status-bar {
   border-top: 1px solid alpha(@theme_fg_color, 0.08);
+  padding-top: 6px;
 }
 
 button.accent {
