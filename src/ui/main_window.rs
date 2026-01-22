@@ -1,10 +1,11 @@
 use gtk4::prelude::*;
 use gtk4::{ApplicationWindow, Box, Button, Label, Orientation, ScrolledWindow};
 use relm4::{Component, ComponentParts, ComponentSender, RelmWidgetExt, SimpleComponent};
+use relm4::component::{ComponentController, Controller};
 
 use crate::core::capsule::Capsule;
 use crate::core::system_checker::{SystemCheck, SystemStatus};
-use crate::ui::system_setup_dialog::SystemSetupDialog;
+use crate::ui::system_setup_dialog::{SystemSetupDialog, SystemSetupMsg, SystemSetupOutput};
 use std::path::PathBuf;
 
 #[derive(Debug)]
@@ -12,12 +13,14 @@ pub enum MainWindowMsg {
     LoadCapsules,
     OpenInstaller,
     OpenSystemSetup,
+    SystemSetupOutput(SystemSetupOutput),
 }
 
 pub struct MainWindow {
     capsules: Vec<Capsule>,
     games_dir: PathBuf,
     system_check: SystemCheck,
+    system_setup_dialog: Option<Controller<SystemSetupDialog>>,
 }
 
 #[relm4::component(pub)]
@@ -153,6 +156,7 @@ impl SimpleComponent for MainWindow {
             capsules: Vec::new(),
             games_dir,
             system_check,
+            system_setup_dialog: None,
         };
 
         let widgets = view_output!();
@@ -163,7 +167,7 @@ impl SimpleComponent for MainWindow {
         ComponentParts { model, widgets }
     }
 
-    fn update(&mut self, msg: Self::Input, _sender: ComponentSender<Self>) {
+    fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>) {
         match msg {
             MainWindowMsg::LoadCapsules => {
                 match Capsule::scan_directory(&self.games_dir) {
@@ -186,10 +190,21 @@ impl SimpleComponent for MainWindow {
                 
                 println!("Opening system setup dialog...");
                 
-                // Launch the dialog as a separate component
-                SystemSetupDialog::builder()
-                    .launch(self.system_check.clone())
-                    .detach();
+                if let Some(dialog) = &self.system_setup_dialog {
+                    dialog.emit(SystemSetupMsg::Refresh(self.system_check.clone()));
+                    dialog.widget().present();
+                } else {
+                    let dialog = SystemSetupDialog::builder()
+                        .launch(self.system_check.clone())
+                        .forward(sender.input_sender(), MainWindowMsg::SystemSetupOutput);
+                    dialog.widget().present();
+                    self.system_setup_dialog = Some(dialog);
+                }
+            }
+            MainWindowMsg::SystemSetupOutput(SystemSetupOutput::CloseRequested) => {
+                if let Some(dialog) = &self.system_setup_dialog {
+                    dialog.widget().close();
+                }
             }
         }
     }

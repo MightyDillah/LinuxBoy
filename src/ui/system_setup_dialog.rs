@@ -9,9 +9,16 @@ use crate::core::runtime_manager::RuntimeManager;
 pub enum SystemSetupMsg {
     DownloadProton,
     DownloadProgress { status: String, progress: f64 },  // status text and 0.0-1.0 progress
+    DownloadVersion(String),
     DownloadComplete,
     DownloadError(String),
+    Refresh(SystemCheck),
     Close,
+}
+
+#[derive(Debug)]
+pub enum SystemSetupOutput {
+    CloseRequested,
 }
 
 pub struct SystemSetupDialog {
@@ -19,6 +26,7 @@ pub struct SystemSetupDialog {
     runtime_mgr: RuntimeManager,
     download_status: String,
     download_progress: f64,  // 0.0 to 1.0
+    download_version: Option<String>,
     is_downloading: bool,
 }
 
@@ -26,7 +34,7 @@ pub struct SystemSetupDialog {
 impl SimpleComponent for SystemSetupDialog {
     type Init = SystemCheck;
     type Input = SystemSetupMsg;
-    type Output = ();
+    type Output = SystemSetupOutput;
 
     view! {
         #[root]
@@ -35,6 +43,7 @@ impl SimpleComponent for SystemSetupDialog {
             set_modal: true,
             set_default_width: 700,
             set_default_height: 500,
+            set_hide_on_close: true,
 
             #[wrap(Some)]
             set_child = &Box {
@@ -226,6 +235,18 @@ impl SimpleComponent for SystemSetupDialog {
                         set_wrap: true,
                     },
 
+                    append = &Label {
+                        #[watch]
+                        set_visible: model.download_version.is_some(),
+                        #[watch]
+                        set_label: &model
+                            .download_version
+                            .as_deref()
+                            .map(|version| format!("Version: {}", version))
+                            .unwrap_or_default(),
+                        set_halign: gtk4::Align::Start,
+                    },
+
                     append = &ProgressBar {
                         #[watch]
                         set_visible: model.is_downloading,
@@ -271,6 +292,7 @@ impl SimpleComponent for SystemSetupDialog {
             runtime_mgr,
             download_status: String::new(),
             download_progress: 0.0,
+            download_version: None,
             is_downloading: false,
         };
 
@@ -289,12 +311,20 @@ impl SimpleComponent for SystemSetupDialog {
                 self.is_downloading = true;
                 self.download_status = "Fetching latest release information...".to_string();
                 self.download_progress = 0.0;
+                self.download_version = None;
                 
                 let runtime_mgr = self.runtime_mgr.clone();
                 let sender_clone = sender.clone();
                 
+                enum DownloadUpdate {
+                    Progress { status: String, progress: f64 },
+                    Version(String),
+                    Complete,
+                    Error(String),
+                }
+
                 // Create a channel for progress updates
-                let (tx, rx) = std::sync::mpsc::channel::<(String, f64)>();
+                let (tx, rx) = std::sync::mpsc::channel::<DownloadUpdate>();
                 
                 // Spawn blocking thread for download
                 std::thread::spawn(move || {
@@ -302,24 +332,29 @@ impl SimpleComponent for SystemSetupDialog {
                     match runtime_mgr.get_latest_release() {
                         Ok(release) => {
                             println!("Found release: {}", release.tag_name);
+                            let _ = tx.send(DownloadUpdate::Version(release.tag_name.clone()));
+                            let _ = tx.send(DownloadUpdate::Progress {
+                                status: format!("Preparing {} download...", release.tag_name),
+                                progress: 0.0,
+                            });
                             
                             // Install with progress callbacks that send to channel
                             match runtime_mgr.install_proton_ge(&release, |status, progress| {
-                                let _ = tx.send((status, progress));
+                                let _ = tx.send(DownloadUpdate::Progress { status, progress });
                             }) {
                                 Ok(path) => {
                                     println!("✓ Proton-GE installed successfully to: {:?}", path);
-                                    let _ = tx.send(("COMPLETE".to_string(), 1.0));
+                                    let _ = tx.send(DownloadUpdate::Complete);
                                 }
                                 Err(e) => {
                                     eprintln!("✗ Installation failed: {}", e);
-                                    let _ = tx.send((format!("ERROR: {}", e), 0.0));
+                                    let _ = tx.send(DownloadUpdate::Error(e.to_string()));
                                 }
                             }
                         }
                         Err(e) => {
                             eprintln!("✗ Failed to fetch releases: {}", e);
-                            let _ = tx.send((format!("ERROR: Failed to fetch releases: {}", e), 0.0));
+                            let _ = tx.send(DownloadUpdate::Error(format!("Failed to fetch releases: {}", e)));
                         }
                     }
                 });
@@ -332,19 +367,25 @@ impl SimpleComponent for SystemSetupDialog {
                         last_msg = Some(msg);
                     }
                     
-                    if let Some((status, progress)) = last_msg {
-                        if status.starts_with("ERROR:") {
-                            let error = status.strip_prefix("ERROR: ").unwrap_or(&status).to_string();
-                            let _ = sender_clone.input(SystemSetupMsg::DownloadError(error));
-                            return glib::ControlFlow::Break;
-                        } else if status == "COMPLETE" {
-                            let _ = sender_clone.input(SystemSetupMsg::DownloadComplete);
-                            return glib::ControlFlow::Break;
-                        } else {
-                            let _ = sender_clone.input(SystemSetupMsg::DownloadProgress {
-                                status,
-                                progress,
-                            });
+                    if let Some(update) = last_msg {
+                        match update {
+                            DownloadUpdate::Progress { status, progress } => {
+                                let _ = sender_clone.input(SystemSetupMsg::DownloadProgress {
+                                    status,
+                                    progress,
+                                });
+                            }
+                            DownloadUpdate::Version(version) => {
+                                let _ = sender_clone.input(SystemSetupMsg::DownloadVersion(version));
+                            }
+                            DownloadUpdate::Complete => {
+                                let _ = sender_clone.input(SystemSetupMsg::DownloadComplete);
+                                return glib::ControlFlow::Break;
+                            }
+                            DownloadUpdate::Error(error) => {
+                                let _ = sender_clone.input(SystemSetupMsg::DownloadError(error));
+                                return glib::ControlFlow::Break;
+                            }
                         }
                     }
                     
@@ -352,6 +393,10 @@ impl SimpleComponent for SystemSetupDialog {
                 });
             }
             
+            SystemSetupMsg::DownloadVersion(version) => {
+                self.download_version = Some(version);
+            }
+
             SystemSetupMsg::DownloadProgress { status, progress } => {
                 self.download_status = status;
                 self.download_progress = progress;
@@ -359,7 +404,11 @@ impl SimpleComponent for SystemSetupDialog {
             
             SystemSetupMsg::DownloadComplete => {
                 self.is_downloading = false;
-                self.download_status = "✓ Proton-GE installed successfully!".to_string();
+                let version = self
+                    .download_version
+                    .as_deref()
+                    .unwrap_or("latest");
+                self.download_status = format!("✓ Proton-GE {} installed successfully!", version);
                 self.download_progress = 1.0;
                 // Refresh system check
                 self.system_check = SystemCheck::check();
@@ -370,10 +419,15 @@ impl SimpleComponent for SystemSetupDialog {
                 self.download_status = format!("✗ Error: {}", error);
                 self.download_progress = 0.0;
             }
+
+            SystemSetupMsg::Refresh(system_check) => {
+                self.system_check = system_check;
+            }
             
             SystemSetupMsg::Close => {
                 // Dialog closes when button is clicked
                 println!("Closing system setup dialog");
+                let _ = sender.output(SystemSetupOutput::CloseRequested);
             }
         }
     }
