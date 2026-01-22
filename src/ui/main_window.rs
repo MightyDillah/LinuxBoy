@@ -441,7 +441,7 @@ impl SimpleComponent for MainWindow {
         #[root]
         ApplicationWindow {
             set_title: Some("LinuxBoy"),
-            set_default_width: 1100,
+            set_default_width: 840,
             set_default_height: 720,
 
             #[wrap(Some)]
@@ -457,8 +457,8 @@ impl SimpleComponent for MainWindow {
                     set_spacing: 12,
                     set_margin_start: 20,
                     set_margin_end: 20,
-                    set_margin_top: 16,
-                    set_margin_bottom: 12,
+                    set_margin_top: 24,
+                    set_margin_bottom: 14,
                     set_css_classes: &["topbar"],
 
                     append = &Image {
@@ -508,6 +508,7 @@ impl SimpleComponent for MainWindow {
                     set_vexpand: true,
                     set_margin_start: 12,
                     set_margin_end: 12,
+                    set_margin_top: 10,
 
                     #[local_ref]
                     library_page -> Box {},
@@ -519,8 +520,8 @@ impl SimpleComponent for MainWindow {
                     set_spacing: 12,
                     set_margin_start: 20,
                     set_margin_end: 20,
-                    set_margin_top: 18,
-                    set_margin_bottom: 20,
+                    set_margin_top: 24,
+                    set_margin_bottom: 28,
                     set_css_classes: &["status-bar"],
 
                     append = &Label {
@@ -582,9 +583,11 @@ impl SimpleComponent for MainWindow {
         library_page.set_margin_all(20);
         library_page.set_hexpand(true);
         library_page.set_vexpand(true);
+        library_page.set_halign(gtk4::Align::Start);
 
         let library_header = Box::new(Orientation::Horizontal, 12);
         library_header.set_hexpand(true);
+        library_header.set_halign(gtk4::Align::Start);
 
         let library_icon = Image::from_icon_name("folder-open-symbolic");
         library_icon.set_pixel_size(24);
@@ -602,10 +605,10 @@ impl SimpleComponent for MainWindow {
         library_header.append(&library_count_label);
 
         let library_body = Box::new(Orientation::Vertical, 0);
-        library_body.set_halign(gtk4::Align::Center);
+        library_body.set_halign(gtk4::Align::Start);
         library_body.set_hexpand(true);
         library_body.set_vexpand(true);
-        library_body.set_width_request(900);
+        library_body.set_width_request(840);
 
         let games_scroller = ScrolledWindow::new();
         games_scroller.set_hexpand(true);
