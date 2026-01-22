@@ -366,12 +366,15 @@ impl MainWindow {
 
             let installing = capsule.metadata.install_state == InstallState::Installing;
             let is_running = self.active_installs.contains_key(&capsule.capsule_dir);
+            let exe_missing = capsule.metadata.executables.main.path.trim().is_empty();
             let detail_text = if installing {
                 if is_running {
                     "Installer running"
                 } else {
                     "Installer paused"
                 }
+            } else if exe_missing {
+                "Select executable to finish setup"
             } else {
                 "Ready to play"
             };
@@ -712,6 +715,23 @@ impl SimpleComponent for MainWindow {
             MainWindowMsg::InstallerFinished { capsule_dir, success } => {
                 self.active_installs.remove(&capsule_dir);
                 if success {
+                    let mut needs_exe = false;
+                    match Capsule::load_from_dir(&capsule_dir) {
+                        Ok(mut capsule) => {
+                            needs_exe = capsule.metadata.executables.main.path.trim().is_empty();
+                            capsule.metadata.install_state = InstallState::Installed;
+                            if let Err(e) = capsule.save_metadata() {
+                                eprintln!("Failed to update metadata: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to load capsule: {}", e);
+                        }
+                    }
+
+                    if needs_exe {
+                        self.open_exe_dialog(sender.clone(), capsule_dir.clone());
+                    }
                     println!("Installer completed for {:?}", capsule_dir);
                 } else {
                     eprintln!("Installer failed for {:?}", capsule_dir);
