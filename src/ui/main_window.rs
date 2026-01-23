@@ -1572,6 +1572,8 @@ impl MainWindow {
             }
 
             let mut cmd = Self::umu_base_command(&prefix_path, &proton_path, &env_metadata);
+            // Avoid Xalia UI automation errors during installers.
+            cmd.env("PROTON_USE_XALIA", "0");
             cmd.arg(&installer_path);
 
             unsafe {
@@ -1650,6 +1652,8 @@ impl MainWindow {
         metadata: &CapsuleMetadata,
     ) -> bool {
         let mut cmd = Self::umu_base_command(prefix_path, proton_path, metadata);
+        // Avoid Xalia UI automation errors during preflight.
+        cmd.env("PROTON_USE_XALIA", "0");
         // Run a harmless command to force prefix/runtime initialization.
         cmd.arg("cmd");
         cmd.arg("/c");
