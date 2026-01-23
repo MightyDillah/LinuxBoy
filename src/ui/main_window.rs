@@ -12,10 +12,12 @@ use crate::core::runtime_manager::RuntimeManager;
 use crate::core::system_checker::{SystemCheck, SystemStatus};
 use crate::core::umu_database::{UmuDatabase, UmuEntry};
 use crate::ui::system_setup_dialog::{SystemSetupDialog, SystemSetupMsg, SystemSetupOutput};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::rc::Rc;
 use std::{fs, io, thread};
 
 #[derive(Debug)]
@@ -358,7 +360,12 @@ impl MainWindow {
         content.append(&layout);
 
         let sender_clone = sender.clone();
+        let handled = Rc::new(Cell::new(false));
+        let handled_clone = handled.clone();
         dialog.connect_response(move |dialog, response| {
+            if handled_clone.replace(true) {
+                return;
+            }
             match response {
                 ResponseType::Accept => {
                     sender_clone.input(MainWindowMsg::AddGameModeChosen(AddGameMode::Installer));
@@ -406,7 +413,12 @@ impl MainWindow {
         dialog.add_filter(&filter);
 
         let sender_clone = sender.clone();
+        let handled = Rc::new(Cell::new(false));
+        let handled_clone = handled.clone();
         dialog.connect_response(move |dialog, response| {
+            if handled_clone.replace(true) {
+                return;
+            }
             if response == ResponseType::Accept {
                 if let Some(file) = dialog.file() {
                     if let Some(path) = file.path() {
@@ -447,7 +459,12 @@ impl MainWindow {
         content.append(&entry);
 
         let sender_clone = sender.clone();
+        let handled = Rc::new(Cell::new(false));
+        let handled_clone = handled.clone();
         dialog.connect_response(move |dialog, response| {
+            if handled_clone.replace(true) {
+                return;
+            }
             if response == ResponseType::Accept {
                 let name = entry.text().to_string();
                 sender_clone.input(MainWindowMsg::GameNameConfirmed(name));
