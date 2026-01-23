@@ -1650,7 +1650,10 @@ impl MainWindow {
         metadata: &CapsuleMetadata,
     ) -> bool {
         let mut cmd = Self::umu_base_command(prefix_path, proton_path, metadata);
-        cmd.arg("");
+        // Run a harmless command to force prefix/runtime initialization.
+        cmd.arg("cmd");
+        cmd.arg("/c");
+        cmd.arg("exit");
         match cmd.status() {
             Ok(status) => status.success(),
             Err(e) => {
