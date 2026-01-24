@@ -75,7 +75,7 @@ impl SystemCheck {
             if vcredist_cached { "downloaded" } else { "missing" }
         );
         println!(
-            "  DirectX web setup cache: {}",
+            "  DirectX redist cache: {}",
             if dxweb_cached { "downloaded" } else { "missing" }
         );
         if missing_apt_packages.is_empty() {
@@ -124,7 +124,7 @@ impl SystemCheck {
     }
 
     pub fn dxweb_cache_path() -> PathBuf {
-        Self::get_deps_dir().join("dxwebsetup.exe")
+        Self::get_deps_dir().join("directx_Jun2010_redist.exe")
     }
 
     /// Check if a command exists in PATH

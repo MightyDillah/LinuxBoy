@@ -192,11 +192,11 @@ else
   echo "VC++ AIO release asset not found (optional)."
 fi
 
-DXWEB_URL="https://download.microsoft.com/download/1/7/1/1718ccc4-6315-4d8e-9543-8e28a4e18c4c/dxwebsetup.exe"
-DXWEB_DEST="${CACHE_DIR}/dxwebsetup.exe"
-echo "Downloading DirectX web installer..."
-if ! download_if_missing "$DXWEB_URL" "$DXWEB_DEST" 1; then
-  echo "DirectX web installer download failed (optional)."
+DXREDIST_URL="https://download.microsoft.com/download/8/4/a/84a35bf1-dafe-4ae8-82af-ad2ae20b6b14/directx_Jun2010_redist.exe"
+DXREDIST_DEST="${CACHE_DIR}/directx_Jun2010_redist.exe"
+echo "Downloading DirectX June 2010 redist..."
+if ! download_if_missing "$DXREDIST_URL" "$DXREDIST_DEST" 1; then
+  echo "DirectX redist download failed (optional)."
 fi
 
 if [ -f "./Cargo.toml" ]; then

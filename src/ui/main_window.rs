@@ -18,6 +18,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{fs, io, thread};
 
 #[derive(Debug)]
@@ -769,7 +770,7 @@ impl MainWindow {
         vcredist_row.append(&vcredist_status);
 
         let dxweb_row = Box::new(Orientation::Vertical, 4);
-        let dxweb_check = CheckButton::with_label("DirectX Web Installer");
+        let dxweb_check = CheckButton::with_label("DirectX (June 2010) Redist");
         dxweb_check.set_active(metadata.install_dxweb && dxweb_cached);
         dxweb_check.set_sensitive(dxweb_cached);
         let dxweb_status = Label::new(Some(if dxweb_cached {
@@ -854,7 +855,7 @@ impl MainWindow {
             if path.is_file() {
                 tasks.push((Self::DEP_DXWEB, path));
             } else {
-                eprintln!("DirectX installer not cached; run linuxboy-setup.sh");
+                eprintln!("DirectX redist not cached; run linuxboy-setup.sh");
             }
         }
 
@@ -869,18 +870,25 @@ impl MainWindow {
         thread::spawn(move || {
             let mut installed: Vec<String> = Vec::new();
             for (dep, path) in tasks {
-                let mut cmd = Self::umu_base_command(&prefix_path, &proton_path, &metadata);
-                cmd.arg(&path);
-                match cmd.status() {
-                    Ok(status) if status.success() => {
-                        installed.push(dep.to_string());
+                let success = if dep == Self::DEP_DXWEB {
+                    Self::install_directx_redist(&prefix_path, &proton_path, &metadata, &path)
+                } else {
+                    let mut cmd = Self::umu_base_command(&prefix_path, &proton_path, &metadata);
+                    cmd.env("PROTON_USE_XALIA", "0");
+                    cmd.arg(&path);
+                    match cmd.status() {
+                        Ok(status) => status.success(),
+                        Err(e) => {
+                            eprintln!("Failed to run dependency installer {:?}: {}", path, e);
+                            false
+                        }
                     }
-                    Ok(_) => {
-                        eprintln!("Dependency installer failed: {:?}", path);
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to run dependency installer {:?}: {}", path, e);
-                    }
+                };
+
+                if success {
+                    installed.push(dep.to_string());
+                } else {
+                    eprintln!("Dependency installer failed: {:?}", path);
                 }
             }
 
@@ -1330,7 +1338,7 @@ impl MainWindow {
 
         let vcredist_check = CheckButton::with_label("Install VC++ Redistributables (AIO)");
         vcredist_check.set_active(capsule.metadata.install_vcredist);
-        let dxweb_check = CheckButton::with_label("Install DirectX Web Setup");
+        let dxweb_check = CheckButton::with_label("Install DirectX (June 2010) Redist");
         dxweb_check.set_active(capsule.metadata.install_dxweb);
 
         let install_deps_button = Button::with_label("Install dependencies now");
@@ -1644,6 +1652,70 @@ impl MainWindow {
             }
         }
         cmd
+    }
+
+    fn create_temp_dir(prefix: &str) -> io::Result<PathBuf> {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("{}-{}", prefix, nanos));
+        fs::create_dir_all(&path)?;
+        Ok(path)
+    }
+
+    fn install_directx_redist(
+        prefix_path: &PathBuf,
+        proton_path: &PathBuf,
+        metadata: &CapsuleMetadata,
+        redist_path: &Path,
+    ) -> bool {
+        let temp_dir = match Self::create_temp_dir("linuxboy-dxredist") {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!("Failed to create DirectX temp dir: {}", e);
+                return false;
+            }
+        };
+
+        let extract_arg = format!("/T:{}", temp_dir.display());
+        let mut extract_cmd = Self::umu_base_command(prefix_path, proton_path, metadata);
+        extract_cmd.env("PROTON_USE_XALIA", "0");
+        extract_cmd.arg(redist_path);
+        extract_cmd.arg("/Q");
+        extract_cmd.arg(extract_arg);
+        let extracted = match extract_cmd.status() {
+            Ok(status) => status.success(),
+            Err(e) => {
+                eprintln!("Failed to extract DirectX redist: {}", e);
+                false
+            }
+        };
+        if !extracted {
+            let _ = fs::remove_dir_all(&temp_dir);
+            return false;
+        }
+
+        let dxsetup_path = temp_dir.join("DXSETUP.exe");
+        if !dxsetup_path.is_file() {
+            eprintln!("DirectX redist extraction missing DXSETUP.exe");
+            let _ = fs::remove_dir_all(&temp_dir);
+            return false;
+        }
+
+        let mut install_cmd = Self::umu_base_command(prefix_path, proton_path, metadata);
+        install_cmd.env("PROTON_USE_XALIA", "0");
+        install_cmd.arg(&dxsetup_path);
+        install_cmd.arg("/silent");
+        let success = match install_cmd.status() {
+            Ok(status) => status.success(),
+            Err(e) => {
+                eprintln!("Failed to run DXSETUP.exe: {}", e);
+                false
+            }
+        };
+        let _ = fs::remove_dir_all(&temp_dir);
+        success
     }
 
     fn run_umu_preflight(

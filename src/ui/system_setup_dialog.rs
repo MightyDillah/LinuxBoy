@@ -489,7 +489,7 @@ impl SimpleComponent for SystemSetupDialog {
                             },
 
                             append = &Label {
-                                set_label: "Pre-download VC++ and DirectX installers for post-install steps.",
+                                set_label: "Pre-download VC++ and DirectX redist for post-install steps.",
                                 set_css_classes: &["muted"],
                                 set_halign: gtk4::Align::Start,
                                 set_wrap: true,
@@ -515,9 +515,9 @@ impl SimpleComponent for SystemSetupDialog {
                             append = &Label {
                                 #[watch]
                                 set_markup: if model.system_check.dxweb_cached {
-                                    "<span foreground='#2ecc71'>✓ DirectX cached</span>"
+                                    "<span foreground='#2ecc71'>✓ DirectX redist cached</span>"
                                 } else {
-                                    "<span foreground='#f39c12'>✗ DirectX missing</span>"
+                                    "<span foreground='#f39c12'>✗ DirectX redist missing</span>"
                                 },
                                 set_halign: gtk4::Align::End,
                             },
