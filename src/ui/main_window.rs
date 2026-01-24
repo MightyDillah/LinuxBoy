@@ -1654,31 +1654,29 @@ impl MainWindow {
         cmd
     }
 
-    fn create_temp_dir(prefix: &str) -> io::Result<PathBuf> {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("{}-{}", prefix, nanos));
-        fs::create_dir_all(&path)?;
-        Ok(path)
-    }
-
     fn install_directx_redist(
         prefix_path: &PathBuf,
         proton_path: &PathBuf,
         metadata: &CapsuleMetadata,
         redist_path: &Path,
     ) -> bool {
-        let temp_dir = match Self::create_temp_dir("linuxboy-dxredist") {
-            Ok(path) => path,
-            Err(e) => {
-                eprintln!("Failed to create DirectX temp dir: {}", e);
-                return false;
-            }
-        };
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let temp_dir_name = format!("linuxboy-dxredist-{}", nanos);
+        let host_temp_dir = prefix_path
+            .join("drive_c")
+            .join("linuxboy-temp")
+            .join(&temp_dir_name);
+        let windows_temp_dir = format!("C:\\\\linuxboy-temp\\\\{}", temp_dir_name);
 
-        let extract_arg = format!("/T:{}", temp_dir.display());
+        if let Err(e) = fs::create_dir_all(&host_temp_dir) {
+            eprintln!("Failed to create DirectX temp dir: {}", e);
+            return false;
+        }
+
+        let extract_arg = format!("/T:{}", windows_temp_dir);
         let mut extract_cmd = Self::umu_base_command(prefix_path, proton_path, metadata);
         extract_cmd.env("PROTON_USE_XALIA", "0");
         extract_cmd.arg(redist_path);
@@ -1691,14 +1689,14 @@ impl MainWindow {
             }
         };
         if !extracted {
-            let _ = fs::remove_dir_all(&temp_dir);
+            let _ = fs::remove_dir_all(&host_temp_dir);
             return false;
         }
 
-        let dxsetup_path = temp_dir.join("DXSETUP.exe");
+        let dxsetup_path = host_temp_dir.join("DXSETUP.exe");
         if !dxsetup_path.is_file() {
             eprintln!("DirectX redist extraction missing DXSETUP.exe");
-            let _ = fs::remove_dir_all(&temp_dir);
+            let _ = fs::remove_dir_all(&host_temp_dir);
             return false;
         }
 
@@ -1712,7 +1710,7 @@ impl MainWindow {
                 false
             }
         };
-        let _ = fs::remove_dir_all(&temp_dir);
+        let _ = fs::remove_dir_all(&host_temp_dir);
         success
     }
 
