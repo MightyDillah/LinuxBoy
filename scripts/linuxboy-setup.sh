@@ -164,6 +164,8 @@ download_if_missing() {
 }
 
 VCREDIST_API="https://api.github.com/repos/abbodi1406/vcredist/releases/latest"
+VCREDIST_URL=""
+set +e
 VCREDIST_URL="$(
   curl -sL "$VCREDIST_API" | python3 -c '
 import json, sys
@@ -177,8 +179,8 @@ for name in preferred:
             sys.exit(0)
 sys.exit(1)
 '
-  || true
 )"
+set -e
 
 VCREDIST_DEST="${CACHE_DIR}/vcredist_aio.exe"
 if [ -n "$VCREDIST_URL" ]; then
