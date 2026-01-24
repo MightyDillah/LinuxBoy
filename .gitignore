@@ -27,6 +27,7 @@ test-games/
 redistributables/
 appimagetool-*.AppImage
 wine-prefixes/
+.DS_Store
 
 # Development docs (not for public repo)
 .dev/
