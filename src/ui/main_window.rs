@@ -1682,7 +1682,6 @@ impl MainWindow {
         let mut extract_cmd = Self::umu_base_command(prefix_path, proton_path, metadata);
         extract_cmd.env("PROTON_USE_XALIA", "0");
         extract_cmd.arg(redist_path);
-        extract_cmd.arg("/Q");
         extract_cmd.arg(extract_arg);
         let extracted = match extract_cmd.status() {
             Ok(status) => status.success(),
