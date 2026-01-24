@@ -42,6 +42,8 @@ pub struct CapsuleMetadata {
     pub protonfixes_replace_cmds: Vec<String>,
     #[serde(default)]
     pub protonfixes_dxvk_sets: Vec<String>,
+    #[serde(default)]
+    pub xalia_enabled: bool,
     pub wine_version: Option<String>,
     pub dxvk_enabled: bool,
     pub vkd3d_enabled: bool,
@@ -149,6 +151,7 @@ impl Default for CapsuleMetadata {
             protonfixes_tricks: Vec::new(),
             protonfixes_replace_cmds: Vec::new(),
             protonfixes_dxvk_sets: Vec::new(),
+            xalia_enabled: false,
             wine_version: None,
             dxvk_enabled: true,
             vkd3d_enabled: false,

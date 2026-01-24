@@ -20,6 +20,7 @@ use std::process::Command;
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{fs, io, thread};
+use walkdir::WalkDir;
 
 #[derive(Debug)]
 pub enum MainWindowMsg {
@@ -57,6 +58,7 @@ pub enum MainWindowMsg {
         install_vcredist: bool,
         install_dxweb: bool,
         protonfixes_disable: bool,
+        xalia_enabled: bool,
         protonfixes_tricks: Vec<String>,
         protonfixes_replace_cmds: Vec<String>,
         protonfixes_dxvk_sets: Vec<String>,
@@ -86,6 +88,7 @@ pub enum MainWindowMsg {
     DeleteGame(PathBuf),
     ResumeInstall(PathBuf),
     KillInstall(PathBuf),
+    MarkInstallComplete(PathBuf),
     SystemSetupOutput(SystemSetupOutput),
 }
 
@@ -130,6 +133,13 @@ pub(crate) enum AddGameMode {
 #[derive(Debug, Clone)]
 struct UmuMatch {
     entry: UmuEntry,
+    score: i32,
+}
+
+#[derive(Debug, Clone)]
+struct ExecutableGuess {
+    path: PathBuf,
+    shortcut: Option<PathBuf>,
     score: i32,
 }
 
@@ -211,6 +221,407 @@ impl MainWindow {
             .filter(|part| !part.is_empty())
             .map(str::to_string)
             .collect()
+    }
+
+    fn is_exe_file(path: &Path) -> bool {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("exe"))
+            .unwrap_or(false)
+    }
+
+    fn compact_name(value: &str) -> String {
+        UmuDatabase::normalize_title(value)
+    }
+
+    fn path_contains_case_insensitive(path: &Path, needle: &str) -> bool {
+        let lowered = path.to_string_lossy().to_ascii_lowercase();
+        lowered.contains(&needle.to_ascii_lowercase())
+    }
+
+    fn is_ignored_exe(path: &Path) -> bool {
+        let name = path
+            .file_name()
+            .map(|value| value.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        let blocked_exact = [
+            "uninstall.exe",
+            "uninstaller.exe",
+            "setup.exe",
+            "dxsetup.exe",
+            "explorer.exe",
+            "rundll32.exe",
+            "cmd.exe",
+            "powershell.exe",
+            "iexplore.exe",
+            "chrome.exe",
+            "msedge.exe",
+            "firefox.exe",
+            "opera.exe",
+            "brave.exe",
+        ];
+        if blocked_exact.iter().any(|blocked| name == *blocked) {
+            return true;
+        }
+        if name.starts_with("unins") || name.contains("uninstall") {
+            return true;
+        }
+        if name.contains("redist") || name.contains("vcredist") {
+            return true;
+        }
+        for component in path.components() {
+            if let std::path::Component::Normal(value) = component {
+                if value.eq_ignore_ascii_case("windows")
+                    || value.eq_ignore_ascii_case("system32")
+                    || value.eq_ignore_ascii_case("syswow64")
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn score_exe_candidate(
+        path: &Path,
+        shortcut: Option<&Path>,
+        capsule_name: &str,
+        game_dir: Option<&Path>,
+    ) -> i32 {
+        let mut score = 0;
+        if path.is_file() {
+            score += 100;
+        }
+        if shortcut.is_some() {
+            score += 20;
+        }
+
+        let name_compact = Self::compact_name(capsule_name);
+        let exe_name = path
+            .file_stem()
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let exe_compact = Self::compact_name(&exe_name);
+        if !name_compact.is_empty() && !exe_compact.is_empty() {
+            if exe_compact == name_compact {
+                score += 40;
+            } else if exe_compact.contains(&name_compact) {
+                score += 25;
+            }
+        }
+
+        if let Some(shortcut_path) = shortcut {
+            let shortcut_name = shortcut_path
+                .file_stem()
+                .map(|value| value.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let shortcut_compact = Self::compact_name(&shortcut_name);
+            if !name_compact.is_empty() && !shortcut_compact.is_empty() {
+                if shortcut_compact == name_compact {
+                    score += 25;
+                } else if shortcut_compact.contains(&name_compact) {
+                    score += 15;
+                }
+            }
+        }
+
+        if let Some(game_root) = game_dir {
+            if path.starts_with(game_root) {
+                score += 30;
+            }
+        }
+
+        let lowered_path = path.to_string_lossy().to_ascii_lowercase();
+        for bad in ["unins", "uninstall", "dxsetup", "directx", "vcredist", "redist"] {
+            if lowered_path.contains(bad) {
+                score -= 80;
+            }
+        }
+        for bad in ["setup", "installer", "support", "helper", "crash"] {
+            if lowered_path.contains(bad) {
+                score -= 25;
+            }
+        }
+        for bad in ["launcher", "patcher", "updater"] {
+            if lowered_path.contains(bad) {
+                score -= 15;
+            }
+        }
+
+        score
+    }
+
+    fn windows_path_to_host(prefix_path: &Path, windows_path: &str) -> Option<PathBuf> {
+        let trimmed = windows_path.trim_matches('"').trim();
+        if trimmed.len() < 3 {
+            return None;
+        }
+        let normalized = trimmed.replace('/', "\\");
+        let lowered = normalized.to_ascii_lowercase();
+        if !lowered.starts_with("c:\\") {
+            return None;
+        }
+        let relative = &normalized[3..];
+        let sep = std::path::MAIN_SEPARATOR.to_string();
+        let host_rel = relative.replace('\\', &sep);
+        Some(prefix_path.join("drive_c").join(host_rel))
+    }
+
+    fn extract_windows_paths_from_text(text: &str) -> Vec<String> {
+        let mut results = Vec::new();
+        let bytes = text.as_bytes();
+        if bytes.len() < 4 {
+            return results;
+        }
+        let mut i = 0;
+        while i + 2 < bytes.len() {
+            if bytes[i].is_ascii_alphabetic() && bytes[i + 1] == b':' && bytes[i + 2] == b'\\' {
+                let mut end = i + 3;
+                while end < bytes.len() {
+                    let b = bytes[end];
+                    if b.is_ascii_alphanumeric()
+                        || matches!(b, b'\\' | b'/' | b'.' | b'_' | b'-' | b' ' | b'(' | b')')
+                    {
+                        end += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let candidate = &text[i..end];
+                let lower = candidate.to_ascii_lowercase();
+                if let Some(idx) = lower.rfind(".exe") {
+                    let trimmed = candidate[..idx + 4].to_string();
+                    results.push(trimmed);
+                }
+                i = end;
+            } else {
+                i += 1;
+            }
+        }
+        results
+    }
+
+    fn extract_ascii_sequences(bytes: &[u8]) -> Vec<String> {
+        let mut sequences = Vec::new();
+        let mut current: Vec<u8> = Vec::new();
+        for &b in bytes {
+            if b.is_ascii_graphic() || b == b' ' {
+                current.push(b);
+            } else {
+                if current.len() >= 6 {
+                    sequences.push(String::from_utf8_lossy(&current).to_string());
+                }
+                current.clear();
+            }
+        }
+        if current.len() >= 6 {
+            sequences.push(String::from_utf8_lossy(&current).to_string());
+        }
+        sequences
+    }
+
+    fn extract_utf16le_sequences(bytes: &[u8]) -> Vec<String> {
+        let mut sequences = Vec::new();
+        let mut current: Vec<u8> = Vec::new();
+        let mut i = 0;
+        while i + 1 < bytes.len() {
+            let b0 = bytes[i];
+            let b1 = bytes[i + 1];
+            if b1 == 0 && (b0 == 0 || b0.is_ascii_graphic() || b0 == b' ') {
+                if b0 == 0 {
+                    if current.len() >= 6 {
+                        sequences.push(String::from_utf8_lossy(&current).to_string());
+                    }
+                    current.clear();
+                } else {
+                    current.push(b0);
+                }
+                i += 2;
+            } else {
+                if current.len() >= 6 {
+                    sequences.push(String::from_utf8_lossy(&current).to_string());
+                }
+                current.clear();
+                i += 1;
+            }
+        }
+        if current.len() >= 6 {
+            sequences.push(String::from_utf8_lossy(&current).to_string());
+        }
+        sequences
+    }
+
+    fn extract_windows_exe_paths_from_lnk(path: &Path) -> Vec<String> {
+        let mut results = Vec::new();
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(_) => return results,
+        };
+        for seq in Self::extract_ascii_sequences(&bytes)
+            .into_iter()
+            .chain(Self::extract_utf16le_sequences(&bytes))
+        {
+            results.extend(Self::extract_windows_paths_from_text(&seq));
+        }
+        results.sort();
+        results.dedup();
+        results
+    }
+
+    fn lnk_contains_http_url(path: &Path) -> bool {
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(_) => return false,
+        };
+        for seq in Self::extract_ascii_sequences(&bytes)
+            .into_iter()
+            .chain(Self::extract_utf16le_sequences(&bytes))
+        {
+            let lowered = seq.to_ascii_lowercase();
+            if lowered.contains("http://") || lowered.contains("https://") {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn collect_shortcuts(prefix_path: &Path) -> Vec<PathBuf> {
+        let mut roots = Vec::new();
+        let users_dir = prefix_path.join("drive_c").join("users");
+        if let Ok(entries) = fs::read_dir(&users_dir) {
+            for entry in entries.flatten() {
+                let user_dir = entry.path();
+                if !user_dir.is_dir() {
+                    continue;
+                }
+                roots.push(user_dir.join("Desktop"));
+                roots.push(user_dir.join("Start Menu"));
+                roots.push(user_dir.join("Start Menu").join("Programs"));
+            }
+        }
+
+        let mut shortcuts = Vec::new();
+        for root in roots {
+            if !root.is_dir() {
+                continue;
+            }
+            for entry in WalkDir::new(&root).max_depth(6).follow_links(false) {
+                if let Ok(entry) = entry {
+                    if entry.file_type().is_file() && Self::is_exe_file(entry.path()) == false {
+                        if entry
+                            .path()
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            .map(|ext| ext.eq_ignore_ascii_case("lnk"))
+                            .unwrap_or(false)
+                        {
+                            shortcuts.push(entry.path().to_path_buf());
+                        }
+                    }
+                }
+            }
+        }
+        shortcuts
+    }
+
+    fn find_exe_from_shortcuts(
+        prefix_path: &Path,
+        capsule_name: &str,
+        game_dir: Option<&Path>,
+    ) -> Vec<ExecutableGuess> {
+        let mut candidates = Vec::new();
+        for shortcut in Self::collect_shortcuts(prefix_path) {
+            if Self::lnk_contains_http_url(&shortcut) {
+                continue;
+            }
+            for windows_path in Self::extract_windows_exe_paths_from_lnk(&shortcut) {
+                if let Some(host_path) = Self::windows_path_to_host(prefix_path, &windows_path) {
+                    if host_path.is_file()
+                        && Self::is_exe_file(&host_path)
+                        && !Self::is_ignored_exe(&host_path)
+                    {
+                        let score =
+                            Self::score_exe_candidate(&host_path, Some(&shortcut), capsule_name, game_dir);
+                        candidates.push(ExecutableGuess {
+                            path: host_path,
+                            shortcut: Some(shortcut.clone()),
+                            score,
+                        });
+                    }
+                }
+            }
+        }
+        candidates
+    }
+
+    fn find_exe_from_dirs(
+        prefix_path: &Path,
+        capsule_name: &str,
+        game_dir: Option<&Path>,
+    ) -> Vec<ExecutableGuess> {
+        let mut roots = Vec::new();
+        if let Some(game_root) = game_dir {
+            roots.push(game_root.to_path_buf());
+        }
+        let drive_c = prefix_path.join("drive_c");
+        roots.push(drive_c.join("Program Files"));
+        roots.push(drive_c.join("Program Files (x86)"));
+        roots.push(drive_c.join("GOG Games"));
+        roots.push(drive_c.join("Games"));
+
+        if roots.iter().all(|root| !root.is_dir()) {
+            roots.clear();
+            roots.push(drive_c);
+        }
+
+        let mut candidates = Vec::new();
+        for root in roots {
+            if !root.is_dir() {
+                continue;
+            }
+            let walker = WalkDir::new(&root)
+                .max_depth(6)
+                .follow_links(false)
+                .into_iter()
+                .filter_entry(|entry| !Self::path_contains_case_insensitive(entry.path(), "windows"));
+            for entry in walker.flatten() {
+                if entry.file_type().is_file()
+                    && Self::is_exe_file(entry.path())
+                    && !Self::is_ignored_exe(entry.path())
+                {
+                    let score =
+                        Self::score_exe_candidate(entry.path(), None, capsule_name, game_dir);
+                    candidates.push(ExecutableGuess {
+                        path: entry.path().to_path_buf(),
+                        shortcut: None,
+                        score,
+                    });
+                }
+            }
+        }
+        candidates
+    }
+
+    fn guess_executable(capsule: &Capsule) -> Option<ExecutableGuess> {
+        let prefix_path = capsule
+            .capsule_dir
+            .join(format!("{}.AppImage.home", capsule.name))
+            .join("prefix");
+        let game_dir = capsule
+            .metadata
+            .game_dir
+            .as_deref()
+            .map(PathBuf::from)
+            .filter(|path| path.is_dir());
+
+        let mut candidates =
+            Self::find_exe_from_shortcuts(&prefix_path, &capsule.name, game_dir.as_deref());
+        if candidates.is_empty() {
+            candidates =
+                Self::find_exe_from_dirs(&prefix_path, &capsule.name, game_dir.as_deref());
+        }
+        candidates.sort_by(|a, b| b.score.cmp(&a.score));
+        candidates.into_iter().next()
     }
 
     fn vcredist_cache_path() -> PathBuf {
@@ -301,6 +712,83 @@ impl MainWindow {
             .chars()
             .filter(|c| !c.is_control())
             .collect::<String>()
+    }
+
+    fn is_generic_installer_stem(stem: &str) -> bool {
+        let normalized = Self::compact_name(stem);
+        if normalized.is_empty() {
+            return true;
+        }
+        let generic = [
+            "setup",
+            "installer",
+            "install",
+            "gog",
+            "gogsetup",
+            "goginstaller",
+            "setupx64",
+            "setupx86",
+            "update",
+            "patch",
+        ];
+        if generic.contains(&normalized.as_str()) {
+            return true;
+        }
+        if normalized.starts_with("setup") && normalized.len() <= 10 {
+            return true;
+        }
+        false
+    }
+
+    fn is_generic_container_name(name: &str) -> bool {
+        let normalized = Self::compact_name(name);
+        let generic = [
+            "downloads",
+            "download",
+            "desktop",
+            "installers",
+            "installer",
+            "setup",
+        ];
+        generic.contains(&normalized.as_str())
+    }
+
+    fn default_game_name_for_path(mode: AddGameMode, path: &Path) -> Option<String> {
+        let stem = path
+            .file_stem()
+            .map(|value| value.to_string_lossy().to_string())
+            .filter(|value| !value.trim().is_empty());
+        let parent = path
+            .parent()
+            .and_then(|dir| dir.file_name())
+            .map(|value| value.to_string_lossy().to_string())
+            .filter(|value| !value.trim().is_empty());
+
+        let parent_ok = parent
+            .as_deref()
+            .map(|value| !Self::is_generic_container_name(value))
+            .unwrap_or(false);
+
+        let candidate = match mode {
+            AddGameMode::Existing => {
+                if parent_ok {
+                    parent
+                } else {
+                    stem
+                }
+            }
+            AddGameMode::Installer => {
+                if parent_ok {
+                    parent
+                } else {
+                    stem.filter(|value| !Self::is_generic_installer_stem(value))
+                }
+            }
+        };
+
+        candidate
+            .map(|value| Self::sanitize_name(&value))
+            .filter(|value| !value.trim().is_empty())
     }
 
     fn unique_game_dir(&self, base_name: &str) -> PathBuf {
@@ -451,12 +939,28 @@ impl MainWindow {
             .modal(true)
             .transient_for(&self.root_window)
             .build();
+        dialog.set_default_width(420);
+        dialog.set_default_height(180);
+        dialog.set_resizable(false);
         dialog.add_button("Cancel", ResponseType::Cancel);
         dialog.add_button("Create", ResponseType::Accept);
+        dialog.set_default_response(ResponseType::Accept);
 
         let content = dialog.content_area();
+        content.set_margin_all(16);
+        content.set_spacing(10);
+        let label = Label::new(Some("Name your game"));
+        label.set_halign(gtk4::Align::Start);
+        label.set_css_classes(&["section-title"]);
         let entry = Entry::new();
+        entry.set_hexpand(true);
         entry.set_placeholder_text(Some("Enter game name"));
+        if let (Some(path), Some(mode)) = (self.pending_game_path.as_ref(), self.pending_add_mode) {
+            if let Some(default_name) = Self::default_game_name_for_path(mode, path) {
+                entry.set_text(&default_name);
+            }
+        }
+        content.append(&label);
         content.append(&entry);
 
         let sender_clone = sender.clone();
@@ -937,8 +1441,17 @@ impl MainWindow {
         let home_path = capsule.capsule_dir.join(format!("{}.AppImage.home", capsule.name));
         let prefix_path = home_path.join("prefix");
 
+        if !Self::run_umu_preflight(&prefix_path, &proton_path, &capsule.metadata) {
+            eprintln!("UMU runtime preload failed.");
+            return;
+        }
+
+        let exe_path = PathBuf::from(&capsule.metadata.executables.main.path);
         let mut cmd = Self::umu_base_command(&prefix_path, &proton_path, &capsule.metadata);
-        cmd.arg(&capsule.metadata.executables.main.path);
+        cmd.arg(&exe_path);
+        if let Some(exe_dir) = exe_path.parent().filter(|dir| dir.is_dir()) {
+            cmd.current_dir(exe_dir);
+        }
 
         let args = capsule.metadata.executables.main.args.trim();
         if !args.is_empty() {
@@ -1344,6 +1857,13 @@ impl MainWindow {
         let install_deps_button = Button::with_label("Install dependencies now");
         install_deps_button.add_css_class("suggested-action");
 
+        let input_title = Label::new(Some("Input & UI"));
+        input_title.set_halign(gtk4::Align::Start);
+        input_title.set_css_classes(&["section-title"]);
+
+        let xalia_check = CheckButton::with_label("Enable Xalia controller UI layer (may disable mouse)");
+        xalia_check.set_active(capsule.metadata.xalia_enabled);
+
         let pf_title = Label::new(Some("Protonfixes Overrides"));
         pf_title.set_halign(gtk4::Align::Start);
         pf_title.set_css_classes(&["section-title"]);
@@ -1386,6 +1906,8 @@ impl MainWindow {
         layout.append(&vcredist_check);
         layout.append(&dxweb_check);
         layout.append(&install_deps_button);
+        layout.append(&input_title);
+        layout.append(&xalia_check);
         layout.append(&pf_title);
         layout.append(&pf_disable);
         layout.append(&pf_tricks_label);
@@ -1403,6 +1925,7 @@ impl MainWindow {
         let store_entry_clone = store_entry.clone();
         let vcredist_check_clone = vcredist_check.clone();
         let dxweb_check_clone = dxweb_check.clone();
+        let xalia_check_clone = xalia_check.clone();
         let pf_disable_clone = pf_disable.clone();
         let pf_tricks_entry_clone = pf_tricks_entry.clone();
         let pf_replace_entry_clone = pf_replace_entry.clone();
@@ -1415,6 +1938,7 @@ impl MainWindow {
                 let install_vcredist = vcredist_check_clone.is_active();
                 let install_dxweb = dxweb_check_clone.is_active();
                 let protonfixes_disable = pf_disable_clone.is_active();
+                let xalia_enabled = xalia_check_clone.is_active();
                 let protonfixes_tricks = MainWindow::parse_list_input(&pf_tricks_entry_clone.text());
                 let protonfixes_replace_cmds =
                     MainWindow::parse_list_input(&pf_replace_entry_clone.text());
@@ -1437,6 +1961,7 @@ impl MainWindow {
                     install_vcredist,
                     install_dxweb,
                     protonfixes_disable,
+                    xalia_enabled,
                     protonfixes_tricks,
                     protonfixes_replace_cmds,
                     protonfixes_dxvk_sets,
@@ -1454,6 +1979,7 @@ impl MainWindow {
         let store_entry_clone = store_entry.clone();
         let vcredist_check_clone = vcredist_check.clone();
         let dxweb_check_clone = dxweb_check.clone();
+        let xalia_check_clone = xalia_check.clone();
         let pf_disable_clone = pf_disable.clone();
         let pf_tricks_entry_clone = pf_tricks_entry.clone();
         let pf_replace_entry_clone = pf_replace_entry.clone();
@@ -1466,6 +1992,7 @@ impl MainWindow {
             let install_vcredist = vcredist_check_clone.is_active();
             let install_dxweb = dxweb_check_clone.is_active();
             let protonfixes_disable = pf_disable_clone.is_active();
+            let xalia_enabled = xalia_check_clone.is_active();
             let protonfixes_tricks = MainWindow::parse_list_input(&pf_tricks_entry_clone.text());
             let protonfixes_replace_cmds =
                 MainWindow::parse_list_input(&pf_replace_entry_clone.text());
@@ -1488,6 +2015,7 @@ impl MainWindow {
                 install_vcredist,
                 install_dxweb,
                 protonfixes_disable,
+                xalia_enabled,
                 protonfixes_tricks,
                 protonfixes_replace_cmds,
                 protonfixes_dxvk_sets,
@@ -1642,6 +2170,7 @@ impl MainWindow {
             .unwrap_or("none");
         cmd.env("GAMEID", game_id);
         cmd.env("STORE", store);
+        cmd.env("PROTON_USE_XALIA", if metadata.xalia_enabled { "1" } else { "0" });
         if metadata.protonfixes_disable {
             cmd.env("PROTONFIXES_DISABLE", "1");
         }
@@ -1680,7 +2209,9 @@ impl MainWindow {
         let mut extract_cmd = Self::umu_base_command(prefix_path, proton_path, metadata);
         extract_cmd.env("PROTON_USE_XALIA", "0");
         extract_cmd.arg(redist_path);
+        extract_cmd.arg("/Q");
         extract_cmd.arg(extract_arg);
+        extract_cmd.arg("/C");
         let extracted = match extract_cmd.status() {
             Ok(status) => status.success(),
             Err(e) => {
@@ -1703,6 +2234,7 @@ impl MainWindow {
         let mut install_cmd = Self::umu_base_command(prefix_path, proton_path, metadata);
         install_cmd.env("PROTON_USE_XALIA", "0");
         install_cmd.arg(&dxsetup_path);
+        install_cmd.arg("/silent");
         let success = match install_cmd.status() {
             Ok(status) => status.success(),
             Err(e) => {
@@ -1879,6 +2411,15 @@ impl MainWindow {
                     resume_sender.input(MainWindowMsg::ResumeInstall(resume_dir.clone()));
                 });
                 actions.append(&resume_button);
+
+                let finish_dir = capsule.capsule_dir.clone();
+                let finish_sender = sender.clone();
+                let finish_button = Button::with_label("Finish setup");
+                finish_button.add_css_class("flat");
+                finish_button.connect_clicked(move |_| {
+                    finish_sender.input(MainWindowMsg::MarkInstallComplete(finish_dir.clone()));
+                });
+                actions.append(&finish_button);
             }
 
             if !installing && !exe_missing {
@@ -2272,6 +2813,16 @@ impl SimpleComponent for MainWindow {
                     match Capsule::load_from_dir(&capsule_dir) {
                         Ok(mut capsule) => {
                             needs_exe = capsule.metadata.executables.main.path.trim().is_empty();
+                            if needs_exe {
+                                if let Some(guess) = Self::guess_executable(&capsule) {
+                                    capsule.metadata.executables.main.path =
+                                        guess.path.to_string_lossy().to_string();
+                                    capsule.metadata.executables.main.original_shortcut = guess
+                                        .shortcut
+                                        .map(|path| path.to_string_lossy().to_string());
+                                    needs_exe = false;
+                                }
+                            }
                             capsule.metadata.install_state = InstallState::Installed;
                             prompt_deps = self.should_prompt_dependencies(&capsule.metadata);
                             deps_metadata = Some(capsule.metadata.clone());
@@ -2424,6 +2975,7 @@ impl SimpleComponent for MainWindow {
                 install_vcredist,
                 install_dxweb,
                 protonfixes_disable,
+                xalia_enabled,
                 protonfixes_tricks,
                 protonfixes_replace_cmds,
                 protonfixes_dxvk_sets,
@@ -2441,6 +2993,7 @@ impl SimpleComponent for MainWindow {
                         capsule.metadata.install_vcredist = install_vcredist;
                         capsule.metadata.install_dxweb = install_dxweb;
                         capsule.metadata.protonfixes_disable = protonfixes_disable;
+                        capsule.metadata.xalia_enabled = xalia_enabled;
                         capsule.metadata.protonfixes_tricks = protonfixes_tricks;
                         capsule.metadata.protonfixes_replace_cmds = protonfixes_replace_cmds;
                         capsule.metadata.protonfixes_dxvk_sets = protonfixes_dxvk_sets;
@@ -2499,6 +3052,24 @@ impl SimpleComponent for MainWindow {
                     }
                     println!("Killed installer for {:?}", capsule_dir);
                     self.rebuild_games_list(sender.clone());
+                }
+            }
+            MainWindowMsg::MarkInstallComplete(capsule_dir) => {
+                match Capsule::load_from_dir(&capsule_dir) {
+                    Ok(mut capsule) => {
+                        capsule.metadata.install_state = InstallState::Installed;
+                        if let Err(e) = capsule.save_metadata() {
+                            eprintln!("Failed to update metadata: {}", e);
+                            return;
+                        }
+                        if capsule.metadata.executables.main.path.trim().is_empty() {
+                            self.open_game_settings_dialog(sender.clone(), capsule_dir);
+                        }
+                        sender.input(MainWindowMsg::LoadCapsules);
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to load capsule: {}", e);
+                    }
                 }
             }
             MainWindowMsg::OpenSystemSetup => {
