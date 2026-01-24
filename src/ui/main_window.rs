@@ -1706,7 +1706,6 @@ impl MainWindow {
         let mut install_cmd = Self::umu_base_command(prefix_path, proton_path, metadata);
         install_cmd.env("PROTON_USE_XALIA", "0");
         install_cmd.arg(&dxsetup_path);
-        install_cmd.arg("/silent");
         let success = match install_cmd.status() {
             Ok(status) => status.success(),
             Err(e) => {
